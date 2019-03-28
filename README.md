@@ -31,7 +31,7 @@ Note: After installing ipyparllel, the binaries that start the cluster are not i
 	find ~ -name 'ipcluster'
 	export PATH=$PATH:$HOME/.local/bin
 
-For more information on this library and the possibility to define a cluster, recur to the [https://ipyparallel.readthedocs.io/en/latest/](official documentation)
+For more information on this library, recur to the [official documentation](https://ipyparallel.readthedocs.io/en/latest/)
 
 ## Getting started
 
