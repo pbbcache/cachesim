@@ -13,16 +13,11 @@ a powerful tool to aid in the design of new cache-partitioning techniques.
 
 The project relies on Python 2.7.9 or greater and uses the following packages:
 * matplotlib
-* operator
-* csv
-* sys
 * pandas
 * numpy
 * sympy
 * ipyparallel
-* subprocess
 * sklearn
-* time
 * datetime
 * pytz
 
