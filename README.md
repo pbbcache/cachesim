@@ -65,6 +65,7 @@ that will be considered for the simulation; each workload is encoded as a comma-
 * -f is the output mode
 * -p activates the parallel execution of the branch and bound algorithm to calculate the optimal partiotioning.
 * -m specifies the bandwidth model to be applied, in this case the one based on the stall metric.
+* -b defines the maximum attainable bandwidth (MB) in the platform to explore
 * -r allows to only execute a defined range of workloads. It is defined as a comma-separated list and allows to define ranges with - (e.g., if we have 10 workloads and define the flag -r 1,3,5-7,9- we will end up running the workloads 1,3,5,6,7,9,10).
 
 To find all of them you can run the following command:
