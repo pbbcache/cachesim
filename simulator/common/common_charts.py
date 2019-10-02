@@ -21,7 +21,7 @@
 import matplotlib.pyplot as plt
 from matplotlib.markers import *
 
-#Prototyping the scheduler
+# Class to represent a Labeled point to use in creating the output charts of the simulator
 class LabeledPoint:
 	def __init__(self, label, x, y, z=0):
 		self.label = label
@@ -34,7 +34,7 @@ class LabeledPoint:
 
 
 
-## Point vector
+# Function to build an array of Labeled points to use in creating the charts
 def buildArrays(labeledPoints):
 	X=[]
 	Y=[]
@@ -48,7 +48,7 @@ def buildArrays(labeledPoints):
 
 	return (Labels,X,Y,Z)	
 
-
+# Function that creates and shows a 2D scatter chart from labeled points of different algorithms
 def scatter2D(labeledPointsSched,markerSpecs,xlabel,ylabel,windowTitle="Scatter plot 2D"):
 	plt.rcParams["figure.figsize"] = [13.0, 9.0]
 	fig = plt.gcf()
@@ -82,7 +82,8 @@ def scatter2D(labeledPointsSched,markerSpecs,xlabel,ylabel,windowTitle="Scatter 
 	plt.grid(True)
 	plt.show()
 
-def scatter2DGen(labeledPointsSched,markerSpecs,xlabel,ylabel,mode=0,figSize=[9.0,9.0],filename=None,windowTitle=None,legendLocation='best',axes_labelsize=None):
+# Generic function to create and/or save a 2D scatter chart to compare different algorithms
+def scatter2DGen(labeledPointsSched,markerSpecs,xlabel,ylabel,mode=0,figSize=[9.0,9.0],filename=None,windowTitle=None,legendLocation='best',axes_labelsize=None,show_window=False):
 	plt.rcParams["figure.figsize"]=figSize
 
 	plt.figure()
@@ -131,4 +132,7 @@ def scatter2DGen(labeledPointsSched,markerSpecs,xlabel,ylabel,mode=0,figSize=[9.
 	plt.draw()
 	if filename!=None:
 		plt.savefig(filename)
+
+	if show_window:
+		plt.show()
 	return 0

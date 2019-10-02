@@ -34,9 +34,18 @@ import time
 import functools
 import datetime
 import pytz
+import os
+from bisect import bisect_left
+import threading
+import zmq
+import socket
+import uuid
+from ipyparallel.util import disambiguate_url
+import ctypes 
 
-# Best 3, 6 (split / and get last)
+# Function to parse a harness file
 def parse_harness_file(filename):
+	# Best 3, 6 (split / and get last)
 	inputfile=open(filename, "r")
 	benchmarks=[] ## Empty dict
 	## Skip header	
@@ -50,6 +59,21 @@ def parse_harness_file(filename):
 		line=inputfile.readline()
 	return benchmarks
 	
+
+
+glb_algorithms_supported=["opt-stp","yu-petrov","opt-unf","ucp","ucp-slowdown","kpart","whirlpool","whirlpool-c","equal-part","optc-stp","optc-unf","opt-unf-np","opt-stp-np","yu-petrov","user","kpart-opt","opt-stp-bf","opt-unf-bf","optc-stp-bf","optc-unf-bf"]
+
+# Function to add extra algorithms to supported global list
+def add_extra_algorithms(*algs):
+	global glb_algorithms_supported
+	for alg in algs:
+		glb_algorithms_supported.append(alg)
+
+# Function to obtain the global supported algorithms
+def get_algorithm_names():
+	global glb_algorithms_supported
+	return glb_algorithms_supported
+
 
 ################################################################################
 ##             BANDWITH SLOWDOWN MODEL [Morad et al, JPDC'16]                 ##
@@ -120,7 +144,7 @@ def estimate_bw_shared(bw_alone_vector):
 		return guess
 
 
-
+# Function that applies the variation of Morad's probabilistic bandwidth model and returns the estimated overall slowdown
 def apply_bw_model(bw_alone_vector,slowdown_vector,max_bandwidth):
 	bw_alone_vnorm=map(lambda x: x/max_bandwidth,bw_alone_vector)
 
@@ -148,6 +172,7 @@ def apply_bw_model(bw_alone_vector,slowdown_vector,max_bandwidth):
 glb_active_bw_model=0
 glb_available_bw_models=["simple","stalls"]
 
+# Function to select which bandwidth model to use (traditional, improved, etc.)
 def select_bw_model(str_model):
 	global glb_active_bw_model
 	if str_model in glb_available_bw_models:
@@ -156,6 +181,7 @@ def select_bw_model(str_model):
 		print >> sys.stderr, "No such BW model: ", str_model
 		exit(1)
 
+# Function that applies the bandwidth model for a specific application list, the assigned ways and the maximum observed bandwidth
 def apply_bw_model_gen(benchmark_list,ways_assigned,max_bandwidth):
 	slowdown_vector = []
 	bw_alone_vector = []
@@ -220,7 +246,7 @@ def apply_bw_model_gen(benchmark_list,ways_assigned,max_bandwidth):
 
 	return overall_slowdown
 
-
+# Function to estimate the bandwidth shared of each application form an array of bandwidth alone and the maximum observed bandwidth
 def determine_bw_shared(bw_alone_vector,max_bandwidth):
 	bw_alone_vnorm=map(lambda x: x/max_bandwidth,bw_alone_vector)
 
@@ -244,9 +270,11 @@ class App:
 		self.name = name
 		self.properties=properties
 		self.scaling_factor=1.
+		self.bench_id=-1
 		## For kpart
 		if parent:
 			self.original_app=parent.original_app
+			self.bench_id=parent.bench_id
 		else:
 			self.original_app=self		
 
@@ -491,9 +519,6 @@ def get_workloads_table_from_csv_gen(summary_csv_path, workloads_csv_path,separa
 		nr_ways=len(ipc_vals)
 
 		# Keep only useful data
-		# THIS HAS BEEN REMOVED TO MAKE THE CODE WORK WITH ANY KIND OF EVENTS...
-		#benchmark_dframe = benchmark_dframe[["bandwidth_mbps","llcrpki","llcmpki","slowdown"]]
-
 		benchmark_dict[benchmark_name]=benchmark_dframe
 
 
@@ -550,11 +575,7 @@ def get_workloads_table_from_list_gen(summary_csv_path, workloads, separator=Non
 		nr_ways=len(ipc_vals)
 		benchmark_dframe["slowdown"] = ipc_max/benchmark_dframe["ipc"]
 
-
 		# Keep only useful data
-		# THIS HAS BEEN REMOVED TO MAKE THE CODE WORK WITH ANY KIND OF EVENTS...
-		#benchmark_dframe = benchmark_dframe[["bandwidth_mbps","llcrpki","llcmpki","slowdown"]]
-
 		benchmark_dict[benchmark_name]=benchmark_dframe
 
 
@@ -576,6 +597,30 @@ def get_workloads_table_from_list_gen(summary_csv_path, workloads, separator=Non
 
 def get_workloads_table_from_list(summary_csv_path, workloads, separator=None):
 		return get_workloads_table_from_list_gen(summary_csv_path, workloads)[0]
+
+
+# To do analysis manually with the simulator
+def get_application_info_from_file(summary_csv_path):
+	summary_dframe=pd.read_csv(summary_csv_path,sep=',')
+
+	# Get list of benchmarks
+	benchmarks_list = summary_dframe["BENCH"].unique()
+	apps=[]
+
+	# Get info for each benchmark in the global table
+	for benchmark_name in benchmarks_list:
+		# Get benchmark_name's DataFrame using NR_WAYS as index
+		benchmark_dframe = summary_dframe.loc[summary_dframe["BENCH"] == benchmark_name].set_index("NR_WAYS")
+		
+		## Calculate max IPS and slowdown and save on benchmark_dframe column
+		ipc_vals=benchmark_dframe[["ipc"]].values
+		ipc_max = max(ipc_vals)[0]
+		benchmark_dframe["slowdown"] = ipc_max/benchmark_dframe["ipc"]
+		nr_ways=len(ipc_vals)
+
+		apps.append(App(benchmark_name,benchmark_dframe))
+
+	return apps
 
 ################################################################################
 ##                               PRIVATE FUNCTIONS                            ##
@@ -761,6 +806,24 @@ def number_of_solutions_partitioning_gen(nr_ways,nr_partitions,count_intermediat
 			total_solutions+=number_of_solutions_partitioning_gen(nr_ways-i,nr_partitions-1,count_intermediate)
 
 		return total_solutions 
+
+
+def number_of_nodes_partitioning(nr_ways,nr_partitions):
+	assert nr_partitions<=nr_ways
+
+	if nr_partitions==1 or nr_ways==nr_partitions:
+		return 1		
+	elif nr_ways==nr_partitions+1: ## Just one app can take the extra way...
+		return nr_partitions
+	else:
+		## Recursive case
+		total_nodes= 0
+
+		for i in range(1,nr_ways-(nr_partitions-1)+1):
+			total_nodes+=number_of_nodes_partitioning(nr_ways-i,nr_partitions-1)+1
+
+		return total_nodes 
+
 
 def repr_node(node):
 	out_str = '"['
@@ -991,7 +1054,7 @@ def build_bandwidth_reduction_table(workload, nr_ways):
 # Private function that implements Yu-Petrof algorithm.
 # Params: Bandwidth reduction matrix, total slots and optionally, a threshold.
 # Return: Partitioning solution for that workload.
-def yu_petrof_algorithm(workload, bandwidth_reduction_table, nr_ways, threshold = 0):
+def yu_petrov_algorithm(workload, bandwidth_reduction_table, nr_ways, threshold = 0):
 	solution = []
 	nr_apps=len(bandwidth_reduction_table)
 	available_ways = nr_ways
@@ -1080,258 +1143,6 @@ def get_equal_llc_schedule(nr_partitions, nr_ways):
 			ways_this_app=nr_fair_ways
 
 		solution.append(ways_this_app)
-	return solution
-
-##
-# Return simple custom partitioning 
-def get_simple_schedule(workload, nr_ways, req_threshold):
-	solution = []
-	nr_apps = len(workload)
-	nr_harmless_apps = 0
-	
-	for llcrpki in map(lambda app:app.properties["llcrpki"][nr_ways], workload):
-		if llcrpki < req_threshold:
-			solution.append(1)
-			nr_harmless_apps += 1
-		else:
-			solution.append(0)
-
-	nr_available_ways = nr_ways - nr_harmless_apps
-	nr_harm_apps = nr_apps - nr_harmless_apps
-	nr_fair_ways = nr_available_ways / nr_harm_apps
-	nr_extra_ways = nr_available_ways % nr_harm_apps
-
-	j = 0
-	
-	for i in range(nr_harm_apps):
-		if nr_extra_ways > 0:
-			ways_this_app = nr_fair_ways+1
-			nr_extra_ways = nr_extra_ways-1		
-		else:
-			ways_this_app = nr_fair_ways
-		
-		while solution[j] != 0:
-			j += 1
-		
-		solution[j] = ways_this_app
-
-	return solution
-
-##
-# Return simple 2 custom partitioning 
-def get_simple2_schedule(workload, nr_ways, req_threshold, harmless_ratio):
-	solution = []
-	nr_apps = len(workload)
-	nr_harmless_apps = 0
-	nr_harmless_ways = int(( nr_ways / nr_apps ) * harmless_ratio)
-
-	if nr_harmless_ways < 1:
-		nr_harmless_ways = 1
-	
-	for llcrpki in map(lambda app:app.properties["llcrpki"][nr_ways], workload):
-		if llcrpki < req_threshold:
-			solution.append(nr_harmless_ways)
-			nr_harmless_apps += 1
-		else:
-			solution.append(0)
-
-	nr_available_ways = nr_ways - ( nr_harmless_apps * nr_harmless_ways )
-	nr_harm_apps = nr_apps - nr_harmless_apps
-	nr_fair_ways = nr_available_ways / nr_harm_apps
-	nr_extra_ways = nr_available_ways % nr_harm_apps
-
-	j = 0
-	
-	for i in range(nr_harm_apps):
-		if nr_extra_ways > 0:
-			ways_this_app = nr_fair_ways+1
-			nr_extra_ways = nr_extra_ways-1		
-		else:
-			ways_this_app = nr_fair_ways
-		
-		while solution[j] != 0:
-			j += 1
-		
-		solution[j] = ways_this_app
-
-	return solution
-
-
-##
-# Return smartfake custom partitioning 
-def get_smartfake_schedule(workload, nr_ways, req_threshold, misses_gap_ratio_threshold):
-	solution = []
-	nr_apps = len(workload)
-	nr_harmless_apps = 0
-
-	## HARMLESS APPS SECTION
-	# Search harmless apps and assign 1 way for them
-	for llcrpki in map(lambda app:app.properties["llcrpki"][nr_ways], workload):
-		if llcrpki < req_threshold:
-			solution.append(1)
-			nr_harmless_apps += 1
-		else:
-			solution.append(0)
-
-	## HARM APPS SECTION
-	critical_working_set_list = []
-	ways_harm_apps_list = []
-	
-	# Calculate critical working set for harm apps
-	for i in range(nr_apps):
-		if solution[i] == 0: # If app is a harm app, calculates his working set
-			max_misses_gap = workload[i].properties["llcmpki"][1] - workload[i].properties["llcmpki"][2]
-			ways_in_working_set = 2
-
-			while ways_in_working_set < nr_ways:
-				current_misses_gap = workload[i].properties["llcmpki"][ways_in_working_set] - workload[i].properties["llcmpki"][ways_in_working_set+1]
-				misses_gap_ratio = current_misses_gap / max_misses_gap
-
-				if misses_gap_ratio <= misses_gap_ratio_threshold:
-					break
-
-				ways_in_working_set += 1
-
-			critical_working_set_list.append(ways_in_working_set)
-				
-	
-	nr_available_ways = nr_ways - nr_harmless_apps
-	nr_harm_apps = nr_apps - nr_harmless_apps
-
-	# Calculate ways to assign for each harm app
-	total_weigh = sum(critical_working_set_list)
-
-	for i in range(nr_harm_apps):
-		fair_ways_for_this_app = max(1, int((critical_working_set_list[i] * nr_available_ways) / total_weigh))
-		ways_harm_apps_list.append(fair_ways_for_this_app)
-		nr_available_ways -= fair_ways_for_this_app
-		
-	# Assign ways to harm apps, distributing the existing available ways
-	j = 0
-	
-	for i in range(nr_harm_apps):
-		if nr_available_ways > 0:
-			if nr_available_ways > (nr_harm_apps - i):
-				ways_this_app = ways_harm_apps_list[i] + 2
-				nr_available_ways -= 2
-			else:
-				ways_this_app = ways_harm_apps_list[i] + 1
-				nr_available_ways -= 1
-		else:
-			ways_this_app = ways_harm_apps_list[i]
-		
-		while solution[j] != 0:
-			j += 1
-		
-		solution[j] = ways_this_app
-
-	return solution
-
-
-##
-# Return smartfake custom partitioning 
-def get_smartfake2_schedule(workload, nr_ways, req_threshold, harmless_ratio, misses_gap_ratio_threshold):
-	solution = []
-	nr_apps = len(workload)
-	nr_harmless_apps = 0
-	nr_harmless_ways = int(( nr_ways / nr_apps ) * harmless_ratio)
-
-	if nr_harmless_ways < 1:
-		nr_harmless_ways = 1
-
-	## HARMLESS APPS SECTION
-	# Search harmless apps and assign nr_harmless_ways for them
-	for llcrpki in map(lambda app:app.properties["llcrpki"][nr_ways], workload):
-		if llcrpki < req_threshold:
-			solution.append(nr_harmless_ways)
-			nr_harmless_apps += 1
-		else:
-			solution.append(0)
-
-	## HARM APPS SECTION
-	critical_working_set_list = []
-	ways_harm_apps_list = []
-	
-	# Calculate critical working set for harm apps
-	for i in range(nr_apps):
-		if solution[i] == 0: # If app is a harm app, calculates his working set
-			max_misses_gap = workload[i].properties["llcmpki"][1] - workload[i].properties["llcmpki"][2]
-			ways_in_working_set = 2
-
-			while ways_in_working_set < nr_ways:
-				current_misses_gap = workload[i].properties["llcmpki"][ways_in_working_set] - workload[i].properties["llcmpki"][ways_in_working_set+1]
-				misses_gap_ratio = current_misses_gap / max_misses_gap
-
-				if misses_gap_ratio <= misses_gap_ratio_threshold:
-					break
-
-				ways_in_working_set += 1
-
-			critical_working_set_list.append(ways_in_working_set)
-				
-	
-	nr_available_ways = nr_ways - (nr_harmless_apps * nr_harmless_ways)
-	nr_harm_apps = nr_apps - nr_harmless_apps
-
-	# Calculate ways to assign for each harm app
-	total_weigh = sum(critical_working_set_list)
-
-	for i in range(nr_harm_apps):
-		fair_ways_for_this_app = max(1, int((critical_working_set_list[i] * nr_available_ways) / total_weigh))
-		ways_harm_apps_list.append(fair_ways_for_this_app)
-		nr_available_ways -= fair_ways_for_this_app
-		
-	# Assign ways to harm apps, distributing the existing available ways
-	j = 0
-	
-	for i in range(nr_harm_apps):
-		if nr_available_ways > 0:
-			if nr_available_ways > (nr_harm_apps - i):
-				ways_this_app = ways_harm_apps_list[i] + 2
-				nr_available_ways -= 2
-			else:
-				ways_this_app = ways_harm_apps_list[i] + 1
-				nr_available_ways -= 1
-		else:
-			ways_this_app = ways_harm_apps_list[i]
-		
-		while solution[j] != 0:
-			j += 1
-		
-		solution[j] = ways_this_app
-
-	return solution
-
-
-##
-# Calculate LLC partitioning based on rate of demand (BW)
-def on_demand_partitioning(workload,nr_ways,max_bandwidth=float('Inf')):
-	bw_alone_vector=map(lambda app:app.properties["bandwidth_mbps"][nr_ways],workload)
-
-	##Reserve one way for each benchmark
-	nr_apps=len(workload)
-	ways_to_share=nr_ways-nr_apps
-
-	## Apply BW model if necessary
-	if max_bandwidth != float('Inf'):	
-		## Replace slowdown vector ...
-		total_bw,bw_shared=determine_bw_shared(bw_alone_vector,max_bandwidth)
-	else:
-		total_bw=sum(bw_alone_vector)
-		bw_shared=bw_alone_vector
-
-	solution=map(lambda x: int(ways_to_share*(x/total_bw))+1,bw_shared) ## Plus one -> at least one each
-	nr_assigned_ways=sum(solution)
-	nr_remaining_ways=nr_ways-nr_assigned_ways
-
-	## Assign remaining ways in a RR order
-	while nr_remaining_ways>0:
-		i=0
-		while nr_remaining_ways>0 and i<nr_apps:
-			solution[i]=solution[i]+1
-			nr_remaining_ways=nr_remaining_ways-1
-			i=i+1
-
 	return solution
 
 
@@ -1449,6 +1260,49 @@ def subsols_are_promising(benchmark_set, cost_function, max_bandwidth, default_c
 	return [ subsol_is_promising(benchmark_set, cost_function, max_bandwidth, default_cost, op, nr_ways, x) for  x in partial_solutions]
 
 
+class EngineCommunicator(object):
+	def __init__(self, interface='tcp://*', identity=None):
+		self._ctx = zmq.Context()
+		self.pub = self._ctx.socket(zmq.PUB)
+		self.sub = self._ctx.socket(zmq.SUB)
+		#self.sub.setsockopt( zmq.LINGER, 0 )
+
+		# configure sockets
+		self.identity = identity or bytes(uuid.uuid4())
+		self.sub.SUBSCRIBE = b''
+
+		# bind to ports
+		pub_port = self.pub.bind_to_random_port(interface)
+		self.pub_url = interface+":%i"%pub_port
+		# guess first public IP from socket
+		self.location = socket.gethostbyname_ex(socket.gethostname())[-1][0]
+		self.peers = {}
+   
+	def __del__(self):
+		self.pub.close()
+		self.sub.close()
+		self._ctx.term()
+    
+	def info(self):
+		"""return the connection info for this object's sockets."""
+		return (self.identity, self.pub_url, self.location)
+    
+	def connect(self, peers, master=False):
+		"""connect to peers.  `peers` will be a dict of 4-tuples, keyed by name.
+		{peer : (ident, addr, pub_addr, location)}
+		where peer is the name, ident is the XREP identity, addr,pub_addr are the
+		"""
+		for peer, (ident, pub_url, location) in peers.items():
+			self.peers[peer] = ident
+			if ident != self.identity or master:
+				self.sub.connect(disambiguate_url(pub_url, location))
+
+	def publish(self, msg, flags=0):
+		self.pub.send_pyobj(msg,flags=flags)
+
+	def consume(self, flags=0):
+		return self.sub.recv_pyobj(flags=flags)
+
 ## function to set up global data
 gbl_dict={}
 #@dview.remote(block=True):
@@ -1461,12 +1315,53 @@ def set_global_properties(key_vals):
 	if "bw_model" in key_vals:
 		select_bw_model(key_vals["bw_model"])
 
+
+	if "broadcast" in key_vals and key_vals["broadcast"]:
+		com=EngineCommunicator()
+		gbl_dict["com"]=com
+		return com.info()
+
 	#ttps://stackoverflow.com/questions/3061/calling-a-function-of-a-module-by-using-its-name-a-string
 	#if "cost_function" in key_vals:
 		#retrieve function symbol
 
 	return pid	
 
+
+def start_communicator(peers):
+	global gbl_dict
+
+	## Retrieve communicator object
+	com=gbl_dict["com"]
+	## Connect to peers
+	com.connect(peers)
+
+	## Create and start background thread
+	cthread=ComThread(com)
+	cthread.start()
+
+	##Store cthread ref in dict
+	gbl_dict["cthread"]=cthread
+
+def stop_communicator(engine_id):
+	global gbl_dict
+
+	if "com" in gbl_dict:
+		## Send empty list to close communication
+		com=gbl_dict["com"]
+		cthread=gbl_dict["cthread"]
+
+		## This is no longer used as the master notifies itself
+		#if engine_id==0:
+		#	com.publish((None,None))
+			
+		## Wait for cthread to finish
+		cthread.stop()
+		cthread.join()
+
+		del gbl_dict["com"]
+		del gbl_dict["cthread"]
+		del com
 
 def get_global_properties(foo=None):
 	global gbl_dict
@@ -1568,7 +1463,6 @@ def get_optimal_schedule(benchmark_set, cost_function, maximize, nr_ways, max_ba
 	kwargs.setdefault("chunk",1)
 	kwargs.setdefault("parallel_debug",False)
 	kwargs.setdefault("bw_model","simple")
-	kwargs.setdefault("use_remote_params",True)
 	kwargs.setdefault("paraver",False)
 
 	metadatum = {}
@@ -1586,7 +1480,6 @@ def get_optimal_schedule(benchmark_set, cost_function, maximize, nr_ways, max_ba
 	postpruning=kwargs["postpruning"]
 	parallel_debug=kwargs["parallel_debug"]
 	bw_model=kwargs["bw_model"]
-	use_remote_params=kwargs["use_remote_params"]
 	paraver =  kwargs["paraver"]
 
 	## Disable options that do not make sense
@@ -1622,7 +1515,7 @@ def get_optimal_schedule(benchmark_set, cost_function, maximize, nr_ways, max_ba
 	if kwargs["initial_bound"]:
 		default_cost=kwargs["initial_bound"]
 	else:
-		if kwargs["hint_ucp_slowdown"] and not clustering: ## UCP SLOWDOWN NOT SUPPORTED FOR NOW FOR CLUSTERING
+		if kwargs["hint_ucp_slowdown"] and not clustering:
 			heuristic=get_schedule_UCP_gen(workload,nr_ways,metric="slowdown")
 		else:
 			heuristic=get_equal_llc_schedule(len(cluster_list), nr_ways)
@@ -1697,13 +1590,10 @@ def get_optimal_schedule(benchmark_set, cost_function, maximize, nr_ways, max_ba
 					chunkval=1
 
 					## Determine which are good
-					if use_remote_params:
-						if parallel_debug:
-							promising= map(lambda x: subsol_is_promising_parallel(best_cost,x), subsols)
-						else:	
-							promising= lview.map(lambda x: subsol_is_promising_parallel(best_cost,x), subsols,chunksize=chunkval)
-					else:
-						promising= lview.map(lambda x: subsol_is_promising(benchmark_set, cost_function, max_bandwidth, best_cost, op, nr_ways , x), subsols,chunksize=chunkval)		
+					if parallel_debug:
+						promising= map(lambda x: subsol_is_promising_parallel(best_cost,x), subsols)
+					else:	
+						promising= lview.map(lambda x: subsol_is_promising_parallel(best_cost,x), subsols,chunksize=chunkval)
 
 					if async:
 						promising.get()
@@ -1762,7 +1652,7 @@ def get_optimal_schedule(benchmark_set, cost_function, maximize, nr_ways, max_ba
 				# Write header and trace to file
 
 
-		### PURE PARALLEL STAGE
+		### Purely parallel stage
 		nr_subtrees_remaining=len(clusters)
 		if chunk==0:
 			chunk=nr_subtrees_remaining ## process all
@@ -1787,12 +1677,9 @@ def get_optimal_schedule(benchmark_set, cost_function, maximize, nr_ways, max_ba
 					sol=get_optimal_schedule_aux_multi(benchmark_set, cost_function, max_bandwidth, best_cost, op, nr_ways , x, bound)
 					local_node_solutions.append(sol)
 					print sol
-			else:
-			#https://ipyparallel.readthedocs.io/en/latest/api/ipyparallel.html#ipyparallel.LoadBalancedView
-				if use_remote_params:
-					local_node_solutions = lview.map(lambda x: get_optimal_schedule_aux_multi_parallel(best_cost,x,(min_idx!=0) or (not prepruning) or (postpruning)), clusters[min_idx:max_idx])	
-				else:
-					local_node_solutions = lview.map(lambda x: get_optimal_schedule_aux_multi(benchmark_set, cost_function, max_bandwidth, best_cost, op, nr_ways , x, bound), clusters[min_idx:max_idx])		
+			else:			
+				local_node_solutions = lview.map(lambda x: get_optimal_schedule_aux_multi_parallel(best_cost,x,(min_idx!=0) or (not prepruning) or (postpruning)), clusters[min_idx:max_idx])	
+
 			if async: 
 				## Now local_node_solutions is an AsyncMapResult object. But it can be iterated.
 				## Wait for completion.... invoking get (later we'll use metadata!)
@@ -1869,6 +1756,1039 @@ def get_optimal_schedule(benchmark_set, cost_function, maximize, nr_ways, max_ba
 	return (best_cost, best_solution, total_branches, metadatum)
 
 
+################################################################################
+##                           FUNCTIONS FOR PARAVER-TRACING INSTRUMENTATION                          ##
+################################################################################
+
+
+### Code to refactor paraver instrumentation code
+def add_trace_item(trace,stats,start_datet,event_type,include_master=False):
+	offset=2 if include_master else 1
+	start_micros=int((stats["started"]-start_datet).total_seconds()*1000000)
+	end_micros=int((stats["completed"]-start_datet).total_seconds()*1000000)
+	trace.append(["1","%i"% (stats['engine_id']+offset),"1","1","%i"%(stats['engine_id']+offset),str(start_micros),str(end_micros),event_type])
+
+def add_trace_metadata(trace,metadata,start_datet,event_type,include_master=False):
+	for stats in metadata: 
+		add_trace_item(trace,stats,start_datet,event_type,include_master)
+
+def get_trace_timestamp():
+	return datetime.datetime.utcnow()
+
+def add_trace_seq_item(trace,start,end,start_datet,event_type):
+	(start_micros,end_micros)=get_start_end_micros(start,end,start_datet)
+	trace.append(["1","%i"%1,"1","1","%i"%(1),str(start_micros),str(end_micros),event_type])
+
+def generate_start_datet():
+	unlocalized_start = pytz.utc.localize(datetime.datetime.utcnow())
+	start_datet = unlocalized_start.astimezone(pytz.timezone("utc"))
+	return start_datet
+
+def generate_paraver_header(start_datet,nr_engines):
+	end = datetime.datetime.utcnow()
+	# Get sequential time execution
+	end_seqtime=pytz.utc.localize(end)
+	end_seqtime=end_seqtime.astimezone(pytz.timezone("utc"))
+	end_micros=int((end_seqtime-start_datet).total_seconds()*1000000)
+
+	return "#Paraver ({}/{}/{} at {}:{}):{}:1({}):1:1({}:1)\n".format(start_datet.day,start_datet.month,start_datet.year,start_datet.hour,start_datet.minute,end_micros,nr_engines,nr_engines)
+
+
+
+################################################################################
+##                 SEQUENTIAL BEST-FIRST B&B SEARCH APPROACH                  ##
+################################################################################
+
+
+## Entail separate set for sequence and queues...
+def bb_insert_node(seq, keys, item, keyfunc=lambda v: v,key=None):
+	"""Insert an item into a sorted list using a separate corresponding
+		sorted keys list and a keyfunc() to extract the key from each item.
+
+	Based on insert() method in SortedCollection recipe:
+	http://code.activestate.com/recipes/577197-sortedcollection/
+	"""
+	if not key is None:
+		k=key
+	else:
+		k = keyfunc(item)  # Get key.
+	i = bisect_left(keys, k)  # Determine where to insert item.
+	keys.insert(i, k)  # Insert key of item to keys list.
+	seq.insert(i, item)  # Insert the item itself in the corresponding place.
+
+## Extra parameter lower bounds 
+def get_optimal_schedule_bf_seq(benchmark_set, cost_function, max_bandwidth, default_cost, op, total_nr_ways, partial_solutions, lower_bounds, bound):
+
+	# To determine n_clusters
+	if type(benchmark_set) is list:
+		cluster_list=benchmark_set
+	else:
+		cluster_list=benchmark_set[1] ## Use cluster rather than that
+
+	n_clusters=len(cluster_list)
+
+	pq=[] ## Priority queue
+	lb=[] ## Lower bound associated with prio queue
+	best_cost=default_cost
+	best_solution=None
+	total_nodes_expanded=0
+
+	## Need to insert root of the tree
+	if len(partial_solutions)==0:
+		pq.append([])
+		lb.append(1) ## It does not really matter
+		total_nodes_expanded=1
+	else:
+		## Transfer solutions thus far to pool
+		for i in range(len(partial_solutions)):
+			bb_insert_node(pq,lb,partial_solutions[i],key=lower_bounds[i])
+
+	## While list is not empty
+	while (pq):
+		partial_solution=pq.pop(0)
+		## Do nothing with ps_lower_bound here
+		ps_lower_bound=lb.pop(0)
+		nr_ways=total_nr_ways-sum(partial_solution)
+		## We visit a new node 
+		level=len(partial_solution)
+		leaf_node=False
+
+		if level == n_clusters - 1: # Trivial Base case
+			partial_solution.append(nr_ways) # Being the last app, we give you all the available 'slots'
+			## Potential optimization (lower bound should match cost in this case, right!)
+			this_cost = cost_function(benchmark_set, partial_solution, max_bandwidth)
+			leaf_node=True
+			total_nodes_expanded+=1
+		elif nr_ways == n_clusters - level: ## Optimization, one way for each app....
+		##Easy ...
+			for i in range(nr_ways):
+				partial_solution.append(1)
+			this_cost = cost_function(benchmark_set, partial_solution, max_bandwidth)
+			leaf_node=True
+			total_nodes_expanded+=1
+		else: 
+		# Non leaf node
+			for nr_ways_assigned in range(1, nr_ways - (n_clusters - level - 1) + 1):
+				new_partial_solution = list(partial_solution)
+				new_partial_solution.append(nr_ways_assigned)
+				remaining_ways = nr_ways - nr_ways_assigned
+
+				this_lower_bound=cost_function(benchmark_set, new_partial_solution, max_bandwidth, remaining_ways)
+
+				total_nodes_expanded+=1
+
+				## Prune
+				if bound and op(best_cost, this_lower_bound):
+					continue
+				else:
+					## Enqueue
+					bb_insert_node(pq,lb,new_partial_solution,key=this_lower_bound)
+
+		
+		if leaf_node and op(this_cost, best_cost):
+			best_cost = this_cost
+			best_solution = partial_solution
+
+			## Purge unpromising nodes in the priority queue
+			for lower_bound in reversed(lb):
+				if  not op(lower_bound, best_cost):
+					lb.pop()
+					pq.pop()
+				else:
+					break ## Sorted list!
+
+	return (best_cost, best_solution, total_nodes_expanded)
+
+################################################################################
+##                 PARALLEL BEST-FIRST B&B SEARCH APPROACH                    ##
+################################################################################
+
+## Background thread to process data from socket
+class ComThread(threading.Thread):
+	def __init__(self,communicator):
+		## Queue of items processed from the socket
+		threading.Thread.__init__(self)
+		self._stop_event = threading.Event() 
+		self.items=[]
+		self.lock=threading.Lock()
+		self.communicator=communicator
+
+	def stop(self):
+		self._stop_event.set()
+		#self.communicator.sub.close()
+	
+	def stopped(self):
+		return self._stop_event.is_set()
+
+	## Thread's main()
+	def run(self):
+		while not self._stop_event.is_set( ):
+			item=None
+			try:
+				item = self.communicator.consume()
+				#print "Item received", item
+				if item[0] is None:
+					break
+			except Exception as e: 
+				print(e)
+				break 
+			
+			if item is None:
+				return 
+			self.lock.acquire()
+			self.items.append(item)
+			self.lock.release()
+
+	## Master uses lower_bound==None
+	def try_to_update_solution(self,local_solution,lower_bound):
+		## Dirty read first: optimization for the most common case
+		if len(self.items)==0:
+			return (False,False)
+		
+		remote_sols=self.consume_items()
+
+		found_better=False
+		master=lower_bound is None ## To be considered later
+
+		## Process most recent solutions first
+		for remote_sol in reversed(remote_sols):
+			(sol,cost)=remote_sol
+			## I am going to update the cost only
+			if (local_solution.is_worse(cost)):
+				found_better=True
+				if master:
+					local_solution.update(sol,cost,False) ## Update sol but do not broadcast sol...
+				else:
+					local_solution.update_cost(cost)
+		
+		if master:
+			return (found_better,False)
+		else:
+			return (found_better,local_solution.is_better(lower_bound))
+
+
+	## Safe method to consume items processed by the thread
+	def consume_items(self):
+		ret_items=[]
+		self.lock.acquire()
+		for item in self.items:
+			ret_items.append(item)
+
+		del self.items[:] ## clear() method is python 3
+	
+		self.lock.release()
+
+		return ret_items
+
+
+## Abstraction to maintain solution neatly
+class SolutionManager:
+	def __init__(self,sol=None,cost=None,op=operator.lt,communicator=None):
+		self.sol=sol
+		self.cost=cost
+		self.op=op
+		self.communicator=communicator
+
+	def get_solution(self):
+		return self.solution
+
+	def get_cost(self):
+		return self.cost
+
+	def update_cost(self,new_cost):
+		self.cost=new_cost
+		self.sol=None ## Not worried about cost
+
+	def update(self,solution,cost,broadcast=True):
+		self.sol=solution
+		self.cost=cost
+
+		if broadcast and self.communicator:
+			self.communicator.publish((self.sol,self.cost))
+	
+	def is_worse(self,this_cost):
+		## this cost cannot be none
+		return self.op(this_cost, self.cost)
+
+	def is_better(self,this_cost):
+		## this cost cannot be none
+		return self.op(self.cost,this_cost)
+
+
+## Function to update global properties after the node processing
+def bb_process_node_result(task,props):
+	if task.cancelled():
+		#TODO consider what to do with cancelled tasks regarding metadata
+		#meta=task.metadata
+		#print meta.keys()
+		#print "Task was cancelled in process"
+		return False
+
+	#node_queue
+	#lb_queue
+	pq=props["node_queue"]
+	lbs=props["lb_queue"]
+	best_solution=props["best_solution"]
+	total_nodes=props["total_nodes"]
+	better_solution=True
+
+	## Get result
+	(nodes_lbs,this_sol,this_cost,node_count)=task.get()
+	#print task.stdout
+
+	## Get metadata
+	if "trace" in props:
+		add_trace_item(props["trace"],task.metadata,props["start_datet"],"1",include_master=props["trace_master"])
+
+	## Update global node count 
+	props["total_nodes"]=total_nodes+node_count
+
+	## Found a better solution
+	if (not this_sol is None) and best_solution.is_worse(this_cost):
+			## Update dict as well
+			best_solution.update(this_sol, this_cost, broadcast=False) 
+
+			#print "New solution found:", this_sol,this_cost
+			better_solution=True
+			## Purge unpromising nodes in the priority queue
+			for lower_bound in reversed(lbs):
+				if  best_solution.is_better(lower_bound):
+					lbs.pop()
+					pq.pop()
+				else:
+					break ## Sorted list!
+
+	## Add to common pool 
+	if better_solution:
+		for node,lb in nodes_lbs:
+			bb_insert_node(pq,lbs,node,key=lb)
+	else:
+		for node,lb in nodes_lbs:
+			##Add if potentially better
+			if  best_solution.is_worse(lb): 
+				bb_insert_node(pq,lbs,node,key=lb)			
+
+	return better_solution
+
+
+def bb_is_leaf_node(partial_solution, nr_clusters, nr_ways):
+	level=len(partial_solution)
+	remain_nr_ways=nr_ways-sum(partial_solution)
+
+	return (level == nr_clusters - 1) or (remain_nr_ways == (nr_clusters - level))
+
+
+## Returns almost the same thing that bb_node_processing_aux
+## (best_solution,best_cost,total_nodes_expanded)	
+def bb_process_leaf_node(benchmark_set, cost_function, max_bandwidth, default_cost, op, nr_ways, partial_solution,nr_clusters,**kwargs):
+	level=len(partial_solution)
+	remain_nr_ways=nr_ways-sum(partial_solution)
+
+	best_solution=None
+	best_cost=default_cost
+	remain_nr_ways=nr_ways-sum(partial_solution)
+	total_nodes_expanded=0
+	leaf_node=False
+
+	if level == nr_clusters - 1: # Trivial Base case
+		partial_solution.append(remain_nr_ways) # Being the last app, we give you all the available 'slots'
+		## Potential optimization (lower bound should match cost in this case, right!)
+		this_cost = cost_function(benchmark_set, partial_solution, max_bandwidth)
+		leaf_node=True
+		total_nodes_expanded+=1
+	elif remain_nr_ways == nr_clusters - level: ## Optimization, one way for each app....
+	##Easy ...
+		for i in range(remain_nr_ways):
+			partial_solution.append(1)
+		this_cost = cost_function(benchmark_set, partial_solution, max_bandwidth)
+		leaf_node=True
+		total_nodes_expanded+=1
+	
+
+	if leaf_node and op(this_cost, best_cost):
+		best_cost = this_cost
+		best_solution = partial_solution
+
+	return (best_solution,best_cost,total_nodes_expanded)	
+
+
+def  bb_node_processing_aux(benchmark_set, cost_function, max_bandwidth, engine_solution, nr_ways, partial_solution,nr_clusters,lower_bound,**kwargs):
+	best_solution=None
+	remain_nr_ways=nr_ways-sum(partial_solution)
+	total_nodes_expanded=0
+
+	if "cthread" in kwargs:
+		cthread=kwargs["cthread"]
+	else:
+		cthread=None
+	
+	## Local queue for this node: tuples -> (subnode,lb)
+	local_queue=[]
+
+	## We visit a new node 
+	level=len(partial_solution)
+	new_solution=None
+
+
+	if bb_is_leaf_node(partial_solution,nr_clusters,nr_ways):
+		## Process leaf node
+		(new_solution,this_cost,total_nodes_expanded)=bb_process_leaf_node(benchmark_set, cost_function, max_bandwidth, engine_solution.cost, engine_solution.op, nr_ways, partial_solution,nr_clusters)
+		## Update better solution
+		if (not new_solution is None):
+			engine_solution.update(new_solution,this_cost)
+			best_solution = new_solution		
+	else: 
+	# Non leaf node
+		for nr_ways_assigned in range(1, remain_nr_ways - (nr_clusters - level - 1) + 1):
+			new_partial_solution = list(partial_solution)
+			new_partial_solution.append(nr_ways_assigned)
+			remaining_ways = remain_nr_ways - nr_ways_assigned
+
+			## Update local solution
+			if cthread is not None:
+				(sol_updated,prune_node)=cthread.try_to_update_solution(engine_solution,lower_bound)
+				## Exit right away
+				if prune_node:
+					return ([],best_solution,engine_solution.cost,total_nodes_expanded)
+
+			## Optimization: Detect terminal nodes automatically and record solution if better
+			if bb_is_leaf_node(new_partial_solution,nr_clusters,nr_ways):
+					## Process leaf node
+					(new_solution,this_cost,count)=bb_process_leaf_node(benchmark_set, cost_function, max_bandwidth, engine_solution.cost, engine_solution.op, nr_ways, new_partial_solution, nr_clusters)
+
+					if count==0:
+						raise Exception('pete')
+
+					## Update best cost if necessary
+					total_nodes_expanded=+1
+					if not new_solution is None:
+						## Update local incumbent 
+						engine_solution.update(new_solution,this_cost)
+						best_solution = new_solution
+
+			else:
+				this_lower_bound=cost_function(benchmark_set, new_partial_solution, max_bandwidth, remaining_ways)
+
+				total_nodes_expanded+=1
+
+				## Prune
+ 				if engine_solution.is_better(this_lower_bound):
+					continue
+				else:
+					## Enqueue
+					local_queue.append((new_partial_solution,this_lower_bound))
+
+
+	## Better solution found when processing leaf node
+	if (not best_solution is None):
+		local_queue=list(filter(lambda item: engine_solution.is_worse(item[1]),local_queue))
+
+	return (local_queue,best_solution,engine_solution.cost,total_nodes_expanded)
+
+
+## Lower bound is not part of the subnode specification
+def bb_break_into_subnodes(node,nr_clusters, total_nr_ways, max_children):
+	if bb_is_leaf_node(node,nr_clusters,total_nr_ways):
+		return [(node,0,0)]
+	else:
+		level=len(node)
+		nr_remaining_ways=total_nr_ways-sum(node)
+		#high_limit=nr_remaining_ways- (nr_clusters - level - 1) + 1
+		num_children=nr_remaining_ways- (nr_clusters - level - 1) 
+
+		if max_children<=0 or num_children<=max_children:
+		##Subnode is the full nodes
+			return [(node,1,num_children+1)]
+		else:
+			subnodes=[]
+			## Loop
+			low_limit=1
+			## Round up
+			nr_partitions=(num_children+(max_children-1))/max_children
+			for i in  range(nr_partitions):
+				high_limit=min(low_limit+max_children,num_children+1)
+				subnodes.append((node,low_limit,high_limit))
+				low_limit=high_limit
+
+			return subnodes
+
+def  bb_subnode_processing(benchmark_set, cost_function, max_bandwidth, engine_solution, nr_ways, subnode ,nr_clusters, max_children,lower_bound,**kwargs):
+	best_solution=None
+	total_nodes_expanded=0
+	(partial_solution, low_limit, high_limit)=subnode
+	remain_nr_ways=nr_ways-sum(partial_solution)
+
+	if "cthread" in kwargs:
+		cthread=kwargs["cthread"]
+	else:
+		cthread=None
+
+	## Local queue for this node: tuples -> (subnode,lb)
+	local_queue=[]
+
+	## We visit a new node 
+	level=len(partial_solution)
+	new_solution=None
+
+
+	if bb_is_leaf_node(partial_solution,nr_clusters,nr_ways):
+		## Process leaf node
+		(new_solution,this_cost,total_nodes_expanded)=bb_process_leaf_node(benchmark_set, cost_function, max_bandwidth, engine_solution.cost, engine_solution.op, nr_ways, partial_solution,nr_clusters)
+
+		## Update better solution
+		if (not new_solution is None):
+			engine_solution.update(new_solution,this_cost)
+			best_solution = new_solution	
+	else: 
+	# Non leaf node
+		for nr_ways_assigned in range(low_limit, high_limit):
+			new_partial_solution = list(partial_solution)
+			new_partial_solution.append(nr_ways_assigned)
+			remaining_ways = remain_nr_ways - nr_ways_assigned
+
+			## Update local solution
+			if cthread is not None:
+				(sol_updated,prune_node)=cthread.try_to_update_solution(engine_solution,lower_bound)
+#				if sol_updated:
+#					print "Solution updated"
+				## Exit right away
+				if prune_node:
+					return ([],best_solution,engine_solution.cost,total_nodes_expanded)
+
+			## Optimization: Detect terminal nodes automatically and record solution if better
+			if bb_is_leaf_node(new_partial_solution,nr_clusters,nr_ways):
+					## Process leaf node
+					(new_solution,this_cost,count)=bb_process_leaf_node(benchmark_set, cost_function, max_bandwidth, engine_solution.cost, engine_solution.op, nr_ways, new_partial_solution, nr_clusters)
+
+					if count==0:
+						raise Exception('pete')
+
+					## Update best cost if necessary
+					total_nodes_expanded=+1
+					if not new_solution is None:
+						## Update local incumbent 
+						engine_solution.update(new_solution,this_cost)
+						best_solution = new_solution	
+
+			else:
+				this_lower_bound=cost_function(benchmark_set, new_partial_solution, max_bandwidth, remaining_ways)
+
+				total_nodes_expanded+=1
+
+				## Prune
+ 				if engine_solution.is_better(this_lower_bound):
+					continue
+				else:
+					## Break down into subnodes and enqueue....
+					subnodes=bb_break_into_subnodes(new_partial_solution,nr_clusters,nr_ways,max_children)
+
+					## Enqueue
+					for subnode in subnodes:
+						local_queue.append((subnode,this_lower_bound))
+
+	## Better solution found when processing leaf node
+	if (not best_solution is None):
+		## Filter out unpromising subnodes
+		local_queue=list(filter(lambda item: engine_solution.is_worse(item[1]),local_queue))
+
+	return (local_queue,best_solution,engine_solution.cost,total_nodes_expanded)
+
+
+def  bb_node_processing(arg):
+	(node, best_cost,lower_bound)=arg
+	## Get globals and invoke function 
+	params=get_global_properties()
+	engine_solution=params["engine_solution"]
+
+
+	## Create best_solution object the very first time
+	if engine_solution is None:
+		## Connect with communicator in broadcast mode
+		if "broadcast" in params and params["broadcast"]:
+			com=params["com"]
+		else:
+			com=None
+		engine_solution=SolutionManager(None,best_cost,params["op"],com)
+		params["engine_solution"]=engine_solution
+
+	else:
+		## See if we can do it better
+		if engine_solution.is_worse(best_cost):
+			engine_solution.update_cost(best_cost)
+	
+	## Set up lower_bound
+	params["lower_bound"]=lower_bound
+	if params["max_children"]<0:
+		params["partial_solution"]=node
+		return bb_node_processing_aux(**params)
+	else:
+		params["subnode"]=node
+		return bb_subnode_processing(**params)
+
+
+def bb_prune_pending(pending_tasks, pending_lbs, best_solution):
+	cancelled_tasks=0
+
+	i=len(pending_lbs)-1
+	for lower_bound in reversed(pending_lbs):
+		if best_solution.is_better(lower_bound):
+			task=pending_tasks[i]
+			if not task.cancel():
+				#print("Failed to cancel task")
+				pass
+			else:
+				#meta=task.metadata
+				#print meta.keys()
+				#print meta
+				#print "Task was cancelled in prune"
+				pass
+				##print "Cancelled task"
+			cancelled_tasks=cancelled_tasks+1	
+			## Removed from structure 
+			pending_tasks.pop()
+			pending_lbs.pop()
+			i=i-1
+		else:
+			break ## Sorted list!
+
+	return cancelled_tasks
+
+
+nr_completed_bb_tasks=0
+cond_var=threading.Condition()
+tasks_completed=[]
+
+def reset_completion_variables():
+	global nr_completed_bb_tasks
+	global cond_var
+	global tasks_completed
+	nr_completed_bb_tasks=0
+	del tasks_completed[:]
+
+
+def wait_until_task_completed():
+	global nr_completed_bb_tasks
+	global cond_var
+	global tasks_completed
+	completed=[]
+	cond_var.acquire()
+
+	while nr_completed_bb_tasks==0:
+		cond_var.wait()
+
+	## Reset bb task count
+	nr_completed_bb_tasks=0
+	for task in tasks_completed:
+		completed.append(task)
+
+	del tasks_completed[:] ## clear() method is python 3
+
+
+	cond_var.release()
+
+	return completed
+
+
+def notify_task_completion(task):
+	global nr_completed_bb_tasks
+	global cond_var
+	cond_var.acquire()
+
+	## Reset bb task count
+	nr_completed_bb_tasks=nr_completed_bb_tasks+1
+
+	tasks_completed.append(task)
+
+	## In this case there is only one thread, so wake it up if necessary
+	cond_var.notify()
+
+	cond_var.release()
+
+
+## Note that the callback is executed in the current thread (launcher)
+## if the task was cancelled. Otherwise the callback is executed by a different
+## thread. That's why we need to verify whether the task has completed or not
+def bb_task_completed(task):
+	if task.cancelled():
+		#print "Cancelled", threading.current_thread().ident 
+		pass
+	else:
+		notify_task_completion(task)
+		#print "Completed", threading.current_thread().ident 
+
+def bb_process_pending(pending_tasks, pending_lbs,bb_props,op, completed=None):
+	## Traverse pending tasks
+	i=0
+	deleted=0
+	better_solution_found=False
+	best_solution=bb_props["best_solution"]
+
+	if completed is None:
+		## First stage (check pending tasks that completed)
+		for task in pending_tasks[:]:
+			cur_cost=pending_lbs[i]
+			if task.ready():
+				if bb_process_node_result(task,bb_props):
+					better_solution_found=True
+				pending_tasks.remove(task)	
+				del pending_lbs[i]
+				deleted=deleted+1
+				#print "task", i, "completed. Removing from list"	
+			else:
+				i=i+1
+	else:
+		for task in completed:
+			i=pending_tasks.index(task)
+			if i==-1 or not task.ready():
+				print "Error"
+				exit(1)
+			if bb_process_node_result(task,bb_props):
+				better_solution_found=True
+			del pending_tasks[i]	
+			del pending_lbs[i]
+			deleted=deleted+1
+
+	if better_solution_found:
+		## Cancel task if pending is worse than incumbent
+		deleted+=bb_prune_pending(pending_tasks, pending_lbs, best_solution)
+
+	return deleted
+
+
+## Busqueda en anchura del arbol
+def bb_generate_solutions_to_explore(nr_ways,nr_apps,target_count):
+	
+	queue=[[]]
+
+	while len(queue)<target_count:
+		node=queue.pop(0)
+		level=len(node)
+                nr_remaining_ways=nr_ways-sum(node)
+		for nr_ways_assigned in range(1, nr_remaining_ways- (nr_apps - level - 1) + 1):
+			subsol=node+[nr_ways_assigned]
+			queue.append(subsol)
+
+	return queue
+
+## Single-workload pruning
+def determine_lower_bound(benchmark_set, cost_function, max_bandwidth, default_cost, op, nr_ways, partial_solution,**kwargs):
+
+	if type(partial_solution) is tuple:
+		partial_solution=partial_solution[0] ## Discard size...
+
+	remaining_ways = nr_ways - sum(partial_solution)
+	new_partial_solution = list(partial_solution)
+	lower_bound=cost_function(benchmark_set, new_partial_solution, max_bandwidth, remaining_ways)
+
+
+	return (lower_bound,not op(default_cost, lower_bound))
+
+
+## Wrappper for avoiding copy of parameters
+def determine_lower_bound_parallel(default_cost,partial_solution):
+
+	params=get_global_properties()
+	params["default_cost"]=default_cost
+	params["partial_solution"]=partial_solution
+
+	return determine_lower_bound(**params)
+
+
+## Extra parameter lower bounds 
+def get_optimal_schedule_bf_par(benchmark_set, cost_function, max_bandwidth, default_cost, op, total_nr_ways, **kwargs):
+	debug=False
+	kwargs.setdefault("bound",True)
+	kwargs.setdefault("print_times",False)
+	kwargs.setdefault("bw_model","simple")
+	kwargs.setdefault("paraver",False)
+	kwargs.setdefault("trace_master",False)
+	kwargs.setdefault("max_children",3)
+	kwargs.setdefault("initial_load_factor",2)
+	kwargs.setdefault("dyn_load_factor",2)
+	kwargs.setdefault("broadcast",False)
+
+	metadatum={}
+
+	if "user_options" in kwargs:
+		## Merge dict with user options... [Overriding defaults...]
+		kwargs.update(kwargs["user_options"])
+
+	## To make things simpler
+	bound=kwargs["bound"]
+	print_times=kwargs["print_times"]
+	bw_model=kwargs["bw_model"]
+	paraver =  kwargs["paraver"]
+	max_children = kwargs["max_children"]
+	initial_load_factor= kwargs["initial_load_factor"]
+	dyn_load_factor= kwargs["dyn_load_factor"]
+	log_enabled=paraver or print_times
+	broadcast=kwargs["broadcast"]
+	trace_master=kwargs["trace_master"]
+
+	reset_completion_variables()
+
+	# To determine n_clusters
+	if type(benchmark_set) is list:
+		cluster_list=benchmark_set
+	else:
+		cluster_list=benchmark_set[1] ## Use cluster rather than that
+
+	nr_clusters=len(cluster_list)
+
+
+	pq=[] ## Priority queue
+	lb=[] ## Lower bound associated with prio queue
+	pending_tasks=[]
+	pending_lbs=[]
+
+	#best_cost=default_cost
+	best_solution=SolutionManager(None,default_cost,op)
+
+	bb_props= { "node_queue": pq,
+						"lb_queue": lb,
+						"best_solution": best_solution,
+						"total_nodes":0}
+
+	rc = ipp.Client(timeout=30000) #debug=True)
+	dview = rc[:]
+	nr_engines=len(rc.ids)
+	dict_globals={"benchmark_set":benchmark_set,
+			"cost_function": cost_function,
+			"max_bandwidth": max_bandwidth,
+			"op": op,
+			"nr_ways": total_nr_ways,
+			"bound": bound,
+			"bw_model": bw_model,
+			"nr_clusters": nr_clusters,
+			"max_children": max_children,
+			"engine_solution": None, ## Critical not to reuse previous crap...
+			"broadcast": broadcast
+			}
+
+	if log_enabled:
+		trace=[]
+		start_datet=generate_start_datet()
+		start=get_trace_timestamp()			
+		bb_props["trace"]=trace
+		bb_props["start_datet"]=start_datet
+		bb_props["trace_master"]=trace_master
+
+	## Setup global variables for engines 
+	# Copy global data
+	ret=dview.apply_async(lambda x: set_global_properties(x),dict_globals)
+
+	if broadcast:
+		peers = ret.get_dict()
+		## Create a local receiver of the solution
+		com=EngineCommunicator()
+
+		## Add this com to peers
+		peers[nr_engines]=com.info()
+
+		if debug:
+			print peers
+
+		## Start communicator remotely
+		dview.apply_sync(lambda x: start_communicator(x),peers)
+
+		## Connect to all publishers, including myself !
+		com.connect(peers,master=True)
+
+		## Initiate local socket thread
+		cthread=ComThread(com)
+		cthread.start()
+	else:
+		ret.get()
+		cthread=None
+
+	## Use Load Balanced View from now on in Async mode
+	lview = rc.load_balanced_view()
+	lview.block = False	
+
+	## Generate initial nodes (to keep processors busy)
+	initial_subsols=bb_generate_solutions_to_explore(total_nr_ways,nr_clusters,initial_load_factor*nr_engines)
+
+	## Determine initial bounds remotely
+	if trace_master:
+		add_trace_seq_item(trace,start,get_trace_timestamp(),start_datet,"7")
+		
+	result=lview.map(lambda x: determine_lower_bound_parallel(best_solution.cost,x), initial_subsols)
+
+	## Wait until everything is done
+	seeds=result.get()
+
+	if log_enabled:
+		if trace_master:
+			start=get_trace_timestamp()	
+		
+		add_trace_metadata(trace,result.metadata,start_datet,"6",include_master=trace_master)
+
+	## We discard those intermediate nodes automatically expanded
+	## Just account for those whose bound function was evaluated
+	bb_props["total_nodes"]=len(initial_subsols)
+
+	for subsol,seed in zip(initial_subsols,seeds):
+		(lbound,promising)=seed
+		if promising:
+			if max_children<0:
+				## Use nodes 
+				bb_insert_node(pq,lb,subsol,key=lbound)
+			else:
+				## Break down into subnodes and enqueue....
+				subnodes=bb_break_into_subnodes(subsol,nr_clusters,total_nr_ways,max_children)
+				## Enqueue subnode
+				for subnode in subnodes:
+					bb_insert_node(pq,lb,subnode,key=lbound)
+
+	## Populate 
+	limit_queue=dyn_load_factor*nr_engines
+
+	## While list is not empty
+	while pq or pending_tasks:
+
+		tasks_submitted=0
+
+		## Retrieve remote solutions and prune if necessary
+		if cthread is not None:
+			(sol_updated,_)=cthread.try_to_update_solution(best_solution,None)
+			
+			## Cancel stuff remotely
+			if sol_updated:
+				#print "Trying to prune from master"
+				bb_prune_pending(pending_tasks, pending_lbs,best_solution)
+
+		## Send everything that we have until a certain limit
+		while pq and len(pending_tasks)<=limit_queue:
+			node=pq.pop(0)
+			ps_lower_bound=lb.pop(0)
+			
+			## Using subnodes really
+			if max_children>=0: 
+				(subsol,ll,hl)=node
+			else:
+				subsol=node
+
+			## Avoid processing leaf nodes remotely
+			if bb_is_leaf_node(subsol,nr_clusters, total_nr_ways):
+				(new_solution,this_cost,total_nodes_expanded)=bb_process_leaf_node(benchmark_set, cost_function, max_bandwidth, best_solution.cost, op, total_nr_ways, subsol,nr_clusters)
+
+				bb_props["total_nodes"]=bb_props["total_nodes"]+1
+
+				## Cancel tasks that can be prunned
+				if not new_solution is None:
+					## Update incumbent and cost
+					best_solution.update(new_solution,this_cost, broadcast=False) 
+
+					if debug:
+						print "New solution found:", new_solution, this_cost 
+					bb_prune_pending(pending_tasks, pending_lbs,best_solution)
+
+			elif (ps_lower_bound is None) or best_solution.is_worse(ps_lower_bound):
+				## No callbacks for now
+				#print node,ps_lower_bound,bb_props["upper_bound"]
+				task = lview.apply_async(bb_node_processing, (node,best_solution.cost,ps_lower_bound))
+
+				task.add_done_callback(bb_task_completed)	
+
+				## Add pending task
+				bb_insert_node(pending_tasks,pending_lbs,task,key=ps_lower_bound)
+				tasks_submitted=tasks_submitted+1
+			else:
+				if debug:
+					print "Task pruned in origin"
+
+
+		if tasks_submitted==0 and pending_tasks:
+			if trace_master:
+				add_trace_seq_item(trace,start,get_trace_timestamp(),start_datet,"7")
+			
+			completed=wait_until_task_completed()
+			
+			if trace_master:
+				start=get_trace_timestamp()			
+			
+			if len(completed)>0:
+				bb_process_pending(pending_tasks, pending_lbs, bb_props, op) # completed)
+
+	if broadcast:
+		## Send  terminating message
+		com.publish((None,None))
+		## Use non-blocking here to try to speed things up
+		ret=lview.map(lambda x: stop_communicator(x),[i for i in range(nr_engines)])
+		cthread.stop() 
+		cthread.join()
+		#ret.get()
+		del com
+	rc.close()
+
+	if log_enabled:
+		if trace_master:
+			add_trace_seq_item(trace,start,get_trace_timestamp(),start_datet,"7")
+		metadatum["header"]=generate_paraver_header(start_datet,nr_engines+trace_master)
+		metadatum["trace"]=trace
+
+	return (best_solution.cost, best_solution.sol, bb_props["total_nodes"],metadatum)
+
+
+
+def get_optimal_schedule_bf(benchmark_set, cost_function, maximize, nr_ways, max_bandwidth=float('Inf'),**kwargs):
+
+	kwargs.setdefault("bound",True)
+	kwargs.setdefault("hint_ucp_slowdown",True)
+	kwargs.setdefault("initial_bound",None)
+	kwargs.setdefault("multiprocessing",False)
+	kwargs.setdefault("user_options",None)
+	kwargs.setdefault("bw_model","simple")
+
+	if "user_options" in kwargs:
+		## Merge dict with user options... [Overriding defaults...]
+		kwargs.update(kwargs["user_options"])
+
+	bound=kwargs["bound"]
+	bw_model=kwargs["bw_model"]
+
+	## To maintain compatibility with the rest of the algorithms
+	metadatum={}
+
+	## Algorithm main code 
+	clustering=not(type(benchmark_set) is list)
+
+	# Determine right operator
+	op = operator.gt if maximize else operator.lt
+	
+	## Be careful, workload can be a clustering now
+	if clustering:
+		workload=benchmark_set[0]
+		cluster_list=benchmark_set[1]
+	else:
+		workload=benchmark_set
+		cluster_list=benchmark_set
+
+
+	## Obtain a candidate solution to begin with
+	if kwargs["initial_bound"]:
+		default_cost=kwargs["initial_bound"]
+	else:
+		if kwargs["hint_ucp_slowdown"] and not clustering:
+			heuristic=get_schedule_UCP_gen(workload,nr_ways,metric="slowdown")
+		else:
+			heuristic=get_equal_llc_schedule(len(cluster_list), nr_ways)
+
+		default_cost=cost_function(benchmark_set,heuristic, max_bandwidth)
+
+	## Sequential version
+	if kwargs["multiprocessing"]:
+		(best_cost, best_solution, total_branches, metadatum) = get_optimal_schedule_bf_par(benchmark_set, cost_function, max_bandwidth, default_cost, op, nr_ways, user_options=kwargs)
+	else:
+		(best_cost, best_solution, total_branches) = get_optimal_schedule_bf_seq(benchmark_set, cost_function, max_bandwidth, default_cost, op, nr_ways, [], [], bound)
+
+	## Case when best solution matches that of heuristic algorithm
+	if not kwargs["initial_bound"] and not best_solution:
+		best_solution=heuristic
+
+	return (best_cost, best_solution, total_branches, metadatum)
+
+
 ##
 # Public function that calculates a solution for workload passed as a parameter using the lookahead algorithm.
 # Params: workload (array of Apps) and slots available.
@@ -1896,9 +2816,9 @@ def get_schedule_UCP_gen(workload, nr_ways, metric="llcmpki"):
 # Public function that calculates a solution for each workload using the Yu-Petrof algorithm.
 # Params: workload (array of Apps) and optionally, a threshold.
 # Return: cache partitioning for the workload
-def get_schedule_yu_petrof(workload, nr_ways, threshold = 0):
+def get_schedule_yu_petrov(workload, nr_ways, threshold = 0):
 	bandwidth_reduction_table = build_bandwidth_reduction_table(workload, nr_ways)
-	return yu_petrof_algorithm(workload, bandwidth_reduction_table, nr_ways, threshold)
+	return yu_petrov_algorithm(workload, bandwidth_reduction_table, nr_ways, threshold)
 
 
 # Weighted access of n mrcs with n float indexes
@@ -1907,6 +2827,9 @@ def access_indexes(mrcs, indexes):
 	for i in range(len(indexes)):
 		r = indexes[i] % 1
 		int_i = int(indexes[i])
+		#if r==0.0:
+		#	v_ns.append(mrcs[i][0])
+		#el
 		if int_i >= len(mrcs[i]):
 			v_ns.append(mrcs[i][int_i-1])
 		elif (r == 0 or int_i+1 >= len(mrcs[i])):
@@ -1914,6 +2837,31 @@ def access_indexes(mrcs, indexes):
 		else:
 			v_ns.append((1-r)*mrcs[i][int_i] + r*mrcs[i][int_i+1])
 	return v_ns
+
+def access_indexes_acc(mrcs, indexes):
+    v_ns = []
+    for i in range(len(indexes)):
+        curve=mrcs[i]
+        nr_ways=len(curve)
+        r = indexes[i] % 1
+        q = int(indexes[i])
+            
+        if q >= nr_ways:
+            v_ns.append(curve[nr_ways-1])
+        elif (r == 0) and (q>=1):
+            v_ns.append(curve[q-1])
+        elif q==0:
+            value=(1-r)*curve[0] + r*curve[1]
+            delta=value-curve[1]
+            value=curve[0]+delta;
+            
+            if value<0:
+                value=1
+            v_ns.append(value)
+        else:
+            v_ns.append((1-r)*curve[q-1] + r*curve[q])
+    return v_ns
+
 
 # Original function from kpart code, combines curves in pairs
 def whirlpool_combined_curve(mrc1, mrc2):
@@ -1928,7 +2876,7 @@ def whirlpool_combined_curve(mrc1, mrc2):
 		v_sum = v1+v2
 		index1 += v1/v_sum
 		index2 += v2/v_sum
-		mrc.append(sum(access_indexes([mrc1,mrc2], [index1,index2])))
+		mrc.append(sum(access_indexes_acc([mrc1,mrc2], [index1,index2])))
 		b1 = int(round(index1))
 		buckets.append((b1,cur_ways+1-b1))
 	return mrc,buckets
@@ -1943,7 +2891,29 @@ def whirlpool_combine_ncurves_f(mrcs,nr_ways):
 		v_sum = sum(v_ns)
 		for i in range(nr_apps):
 			indexes[i] += v_ns[i]/v_sum
-		mrc.append(sum(access_indexes(mrcs,indexes)))
+		mrc.append(sum(access_indexes_acc(mrcs,indexes)))
+		# Save index to return the buckets in the same order as the mrcs
+		total_ways = cur_ways +1
+		cur_buckets = []
+		total_weight = sum(indexes)
+		for i in range(nr_apps):
+			app_bucket=total_ways*indexes[i]/total_weight
+			cur_buckets.append(app_bucket)
+		buckets.append(cur_buckets)
+	return (mrc,buckets)
+
+
+def whirlpoolc_combine_ncurves_f(mrcs,llcmpkcs,nr_ways,agg_function=sum):
+	nr_apps = len(mrcs)
+	indexes = [0.0 for i in range(nr_apps)]
+	mrc = []
+	buckets = []
+	for cur_ways in range(nr_ways):
+		s_ns = access_indexes(llcmpkcs,indexes)
+		s_sum = sum(s_ns)
+		for i in range(nr_apps):
+			indexes[i] += s_ns[i]/s_sum
+		mrc.append(agg_function(access_indexes_acc(mrcs,indexes)))
 		# Save index to return the buckets in the same order as the mrcs
 		total_ways = cur_ways +1
 		cur_buckets = []
@@ -2014,169 +2984,6 @@ def stop_ipcluster():
 	call("pkill ipcluster --signal SIGINT", shell=True)
 	time.sleep(30)
 
-# Input, list of way assignments...
-def minimize_overlapping_partitioning(partitions,nr_ways,fix_intel_bug=True):
-	left=True
-	nr_partitions=len(partitions)
-	overlap_counter=[]
-	masks=[]
-	clusters=[]
-
-	for i in range(nr_ways):
-		overlap_counter.append(0)
-
-	for i in range(nr_partitions):
-		nr_ways_to_assign=partitions[i]
-		##find the way with the lowest degree of overlapping
-		if left:
-			j=1
-			cur_min=overlap_counter[0]
-			min_idx=0
-			
-			while j<nr_ways and cur_min>0:
-				if cur_min>overlap_counter[j]:
-					cur_min=overlap_counter[j]
-					min_idx=j
-				j=j+1
-			## Fill to the left
-			start=min_idx
-
-		else:
-			j=nr_ways-2
-			cur_min=overlap_counter[nr_ways-1]
-			min_idx=nr_ways-1		
-
-			while j>=0 and cur_min>0:
-				if cur_min>overlap_counter[j]:
-					cur_min=overlap_counter[j]
-					min_idx=j
-				j=j-1
-			## Fill to the left
-			start=min_idx-nr_ways_to_assign+1
-	
-		#Intel fix (Not alone...)	
-		if fix_intel_bug and nr_ways==11 and start==10 and nr_ways_to_assign==1:
-			start-=1 # Move it one to the left..
-
-
-		clusters.append((start,nr_ways_to_assign))
-		masks.append(hex((1<<nr_ways_to_assign)-1<<start))
-
-		## Increment overlapping counters
-		for k in range(start,start+nr_ways_to_assign):
-			overlap_counter[k]+=1
-
-		## REverse order for next iteration
-		left=(not left)
-
-	return (masks,clusters)
-
-def get_dunn_index(n_apps,k,normalized_stalls,partitions):
-	# Precompute [min,max] of each cluster
-	clusters = [[1,0] for i in range(k)]
-	for i in range(n_apps):
-		if normalized_stalls[i] < clusters[partitions[i]][0]:
-			clusters[partitions[i]][0] = normalized_stalls[i]
-		if normalized_stalls[i] > clusters[partitions[i]][1]:
-			clusters[partitions[i]][1] = normalized_stalls[i]
-
-	# Order to have adjacent clusters
-	clusters = sorted(clusters,key=lambda x:x[0])
-
-	# In the selfa17 paper: Dunn(k) = d_min/d_max
-	d_min = 1 # min distance between points of diff clusters
-	d_max = 0 # max within-cluster distance
-	for i in range(k):
-		intra_cluster_distance = clusters[i][1] - clusters[i][0]
-		if (intra_cluster_distance > d_max):
-			d_max = intra_cluster_distance
-		if (i<k-1):
-			inter_cluster_distance = clusters[i+1][0] - clusters[i][1]
-			if inter_cluster_distance < d_min:
-				d_min = inter_cluster_distance
-	return d_min / d_max
-
-
-def estimate_ways_exponential(x, max_ways):
-	if max_ways == 20:
-		nways = int(round(19.26833327*np.exp(0.67431637*x) - 17.72167744))
-	elif max_ways == 11:
-		# parameters for 10 ways scaling down the paper ways
-		nways = int(round(4.09659516*np.exp(1.19540837*x) - 2.48157709))
-	return nways
-
-def get_schedule_dunn(workload, nr_ways):
-	n_apps = len(workload)
-	curves=[]
-	for app in workload:
-		curves.append(app.get_metric_table("llcmpki").values)
-
-	(mrc,buckets)=whirlpool_combine_ncurves(curves,nr_ways)
-
-	app_ways=buckets[nr_ways-1]
-	stalls = []
-	for i,app in enumerate(workload):
-		stalls.append(app.properties["stalls_l2_miss"][app_ways[i]])
-
-	stalls_min = min(stalls)
-	stalls_max = max(stalls)
-	normalized_stalls = []
-	for stalls_app in stalls:
-		if stalls_max != stalls_min:
-			n_stalls = (stalls_app-stalls_min)/(stalls_max-stalls_min)
-		else:
-			n_stalls = 1/n_apps
-		normalized_stalls.append(n_stalls)
-
-
-	dunn_min = 100000
-	best_k = 2
-	best_centroids = []
-	best_partitions = []
-	for k in range(2,n_apps):
-		kmeans = KMeans(n_clusters=k)
-		kmeans = kmeans.fit(np.reshape(normalized_stalls,(-1,1)))
-		# Array with the centroid of each partition (odered each time different)
-		centroids = kmeans.cluster_centers_
-		# Position of the centroid array to which each app belongs
-		partitions = kmeans.labels_
-		dunn=get_dunn_index(n_apps,k,normalized_stalls,partitions)
-		if dunn < dunn_min:
-			best_centroids = centroids
-			best_partitions = partitions
-			best_k = k
-			dunn_min = dunn
-	# Each iteration best_partition can reference to different centroids(ordered != each time)
-	o_centroids = [(old_i,c) for old_i,c in enumerate(best_centroids)]
-	o_centroids = sorted(o_centroids,key=lambda x:x[1],reverse=True)
-	cluster_new_i = {old_i:ordered_i for ordered_i,(old_i,c) in enumerate(o_centroids)}
-	# reassign apps cluster index in partitions so it references to the reordered cluster
-	for i in range(len(best_partitions)):
-		best_partitions[i] = cluster_new_i[best_partitions[i]]
-	centroids_ways = [estimate_ways_exponential(x[1],nr_ways) for x in o_centroids]
-	
-	# Check if there is left ways and assign them to the smallest clusters
-	left_ways = nr_ways - sum(centroids_ways)
-	i_smallest = len(centroids_ways)-1
-	while (left_ways > 0):
-		centroids_ways[i_smallest] += 1
-		left_ways -= 1
-		i_smallest = (i_smallest - 1) % len(centroids_ways)
-
-	masks, part_info =  minimize_overlapping_partitioning(centroids_ways,nr_ways)
-
-	per_app_masks = []
-	per_app_ways = []
-	cluster_ids = []
-	per_app_centroids = []
-	for i_app in range(len(best_partitions)):
-		# Assign CLOS to PID
-		per_app_masks.append(masks[best_partitions[i_app]])
-		per_app_ways.append(centroids_ways[best_partitions[i_app]])
-		per_app_centroids.append("%0.3f"%o_centroids[best_partitions[i_app]][1][0])
-		cluster_ids.append(i_app)
-
-	return (per_app_ways,per_app_masks,per_app_centroids,cluster_ids)
 
 def merge_clusters(cluster1,cluster2,curve,buckets):
 	apps=cluster1.apps + cluster2.apps
@@ -2186,11 +2993,19 @@ def merge_clusters(cluster1,cluster2,curve,buckets):
 		scaled_apps.append(App(app.name,app.build_scaled_properties(assigned_ways),parent=app))
 	return Cluster(scaled_apps,curve,buckets)
 
+def raw_unfairness(vals):
+	if len(vals)==1:
+		return vals[0]
+	else:
+		return max(vals)/min(vals)
+
+# Class that stores a cluster of applications, the combined curve that represents it, and the buckets defining how the space is divided between apps
 class Cluster:
 	def __init__(self,apps,curve,buckets):
 		self.apps = apps
 		self.curve = curve
 		self.buckets = buckets
+		self.idx_cluster=min([app.bench_id for app in apps])
 
 	def __repr__(self):
 		names=[]
@@ -2198,7 +3013,7 @@ class Cluster:
 			names.append(app.name)
 		return repr(names)
 
-	def distance(self,cluster2):
+	def distance(self,cluster2,fix_partitioned=True):
 		curves=[]
 		for app in self.apps:
 			curves.append(app.original_app.get_metric_table("llcmpki"))
@@ -2207,13 +3022,33 @@ class Cluster:
 
 		combined_curve,buckets = whirlpool_combine_ncurves_f([c.values for c in curves],len(self.curve))
 
+		if fix_partitioned:
+		
+			# Critical fix: Normalize 1...n
+			# It turns out that the cluster's curves are mere arrays
+			# They need to be accessed in the range 1..n inside 
+			# lookahead_algorithm_gen(), so we need to prepend
+			# a dummy value as item 0.
+
+			curve_a=list(self.curve)
+			curve_b=list(cluster2.curve)
+			curve_a.insert(0,len(self.curve))
+			curve_b.insert(0,len(self.curve))
+			pcurves=[curve_a,curve_b]
+		else:
+			pcurves=curves
+
 		partitioned_curve=[]
 		# Calculate partitioned curve
 		for nr_ways in range(1,len(self.curve)+1):
-			ways_distr = lookahead_algorithm_gen(curves,nr_ways)
-			partitioned_sum = 0
-			for idxapp,assigned_ways in enumerate(ways_distr):
-				partitioned_sum += curves[idxapp][assigned_ways]
+			if nr_ways>1:
+				ways_distr = lookahead_algorithm_gen(pcurves,nr_ways)
+				partitioned_sum = 0
+				for idxapp,assigned_ways in enumerate(ways_distr):
+					partitioned_sum += pcurves[idxapp][assigned_ways]
+			else:
+					partitioned_sum=combined_curve[nr_ways-1]
+
 			partitioned_curve.append(partitioned_sum)
 
 		distance_sum = 0
@@ -2222,6 +3057,60 @@ class Cluster:
 
 		return (distance_sum,combined_curve,buckets,partitioned_curve)	
 
+	def distance_gen(self,cluster2,metric="llcmpki",metric_space="llcmpki",agg_function=sum,use_abs=True,fix_partitioned=True):
+		curves=[]
+		space_curves=[]
+		for app in self.apps:
+			curves.append(app.original_app.get_metric_table(metric))
+			space_curves.append(app.original_app.get_metric_table(metric_space))
+
+		for app in cluster2.apps:
+			curves.append(app.original_app.get_metric_table(metric))
+			space_curves.append(app.original_app.get_metric_table(metric_space))
+
+		combined_curve,buckets = whirlpoolc_combine_ncurves_f([c.values for c in curves],[s.values for s in space_curves],len(self.curve),agg_function=agg_function)
+
+		if fix_partitioned:
+			
+			# Critical fix: Normalize 1...n
+			# It turns out that the cluster's curves are mere arrays
+			# They need to be accessed in the range 1..n inside 
+			# lookahead_algorithm_gen(), so we need to prepend
+			# a dummy value as item 0.
+
+			curve_a=list(self.curve)
+			curve_b=list(cluster2.curve)
+			curve_a.insert(0,len(self.curve))
+			curve_b.insert(0,len(self.curve))
+			pcurves=[curve_a,curve_b]
+		else:
+			pcurves=curves
+
+		partitioned_curve=[]
+		# Calculate partitioned curve
+		for nr_ways in range(1,len(self.curve)+1):
+			if nr_ways>1:
+				ways_distr = lookahead_algorithm_gen(pcurves,nr_ways)
+				values_partitioned=[]
+				for idxapp,assigned_ways in enumerate(ways_distr):
+					values_partitioned.append(pcurves[idxapp][assigned_ways])
+				new_value=agg_function(values_partitioned)
+			else:
+				new_value=combined_curve[nr_ways-1]
+
+			partitioned_curve.append(new_value)
+
+		distance_sum = 0
+		for i in range(len(self.curve)):
+			if use_abs:
+				distance_sum += abs(combined_curve[i] - partitioned_curve[i])
+			else:
+				distance_sum += combined_curve[i] - partitioned_curve[i]
+
+		return (distance_sum,combined_curve,buckets,partitioned_curve)		
+
+	def slowdown_distance(self,cluster2):
+		return self.distance_gen(cluster2,metric="slowdown",metric_space="llcmpkc",agg_function=max,use_abs=False)
 
 	def get_cluster_speedup_curve(self,nr_ways,total_apps,max_bandwidth):
 		speedup_curves=[]
@@ -2265,7 +3154,7 @@ def determine_aggregate_speedup(partitioning,nr_ways,max_bandwidth):
 	return sp_aggregate
 
 
-def determine_best_partitioning(clusters,nr_ways,total_apps,max_bandwidth=float('Inf')):
+def determine_best_partitioning(clusters,nr_ways,total_apps,max_bandwidth=float('Inf'),uoptions={}):
 	speedup_curves=map(lambda x: x.get_cluster_speedup_curve(nr_ways,total_apps,max_bandwidth), clusters)
 	inverse_sp_curves=[1/curve for curve in speedup_curves]
 	nr_ways_equal=int(round(nr_ways/total_apps))
@@ -2306,34 +3195,78 @@ def determine_best_partitioning(clusters,nr_ways,total_apps,max_bandwidth=float(
 		## Restore scaling factors .... 
 		for bw,app in bw_app:
 			app.scaling_factor=1.0
+
+	if len(clusters) >  nr_ways:
+		sp_aggregate = -1
+
 	return (partitioning,per_app_partitioning,bw_app,sp_aggregate)
 
+def determine_best_partitioning_slowdown(clusters,nr_ways,total_apps,max_bandwidth=float('Inf')):
+	slowdown_curves=map(lambda x: x.curve, clusters)
+	# Lookahead
+	if len(clusters)==1:
+		partitioning=[nr_ways]
+	else:
+		partitioning=lookahead_algorithm_gen(slowdown_curves,nr_ways)
+
+	## Determine Per-application way-assignment
+	per_app_partitioning=[]
+	bw_aggregate=0
+	slowdown_aggregate=0
+	bw_app=[]
+	slowdownv=[]
+
+	for idxc,nr_ways_cluster in enumerate(partitioning):
+		## Traverse applications in a cluster to determine 
+		cl=clusters[idxc]
+		buckets=cl.buckets
+		for idxa,app in enumerate(cl.apps):
+			# Now stores the cluster ways so it can later retrieve the scaled value from properties
+			per_app_partitioning.append((app,nr_ways_cluster,idxc))
+			#slowdown_aggregate+=
+			slowdownv.append(app.get_metric_table("slowdown")[nr_ways_cluster])
+			bw_cur=app.get_metric_table("bandwidth_mbps")[nr_ways_cluster]
+			bw_aggregate+=bw_cur
+			bw_app.append((bw_cur,app))
+
+	if len(clusters) >  nr_ways:
+		unfairness_value = 1000
+	else:
+		unfairness_value=max(slowdownv)/min(slowdownv)
+
+	return (partitioning,per_app_partitioning,bw_app,unfairness_value)
 
 
-def get_kpart_schedule(workload,nr_ways,max_bandwidth=float('Inf')):
+def get_kpart_schedule(workload,nr_ways,max_bandwidth=float('Inf'),uoptions={}):
 	curClusters = []
-	total_apps = len(workload)	
+	total_apps = len(workload)
+
 	for i,app in enumerate(workload):
 		buckets = [[nw] for nw in range(1,nr_ways + 1)]
 		curve = app.get_metric_table("llcmpki").values
 		app.bench_id = i
 		cl=Cluster([app],curve,buckets)
 		curClusters.append(cl)
-	
-	solutions = [(list(curClusters),determine_best_partitioning(curClusters,nr_ways,total_apps,max_bandwidth))]
+
+	if uoptions["best_metric"] == "speedup":
+		solutions = [(list(curClusters),determine_best_partitioning(curClusters,nr_ways,total_apps,max_bandwidth,uoptions=uoptions))]
+		# (partitioning,per_app_partitioning,bw_app,sp_aggregate) <- determine_best_part()
+	else:
+		solutions = [(list(curClusters), determine_best_partitioning_slowdown(curClusters, nr_ways, total_apps, max_bandwidth))]
 
 	while len(curClusters) > 1:
 
 		cluster_data=None
 		min_found=30000000
 		min_idx=(-1,-1)
-		
+
 		## Compute distance and keep track of min
 		for idx,clusterRef in enumerate(curClusters):
 			for i in range(idx+1,len(curClusters)):
 				cluster=curClusters[i]
-				(distance,combined_curve,buckets,partitioned_curve)=clusterRef.distance(cluster)
-
+				#distance,combined_curve,buckets,partitioned_curve)=clusterRef.distance_gen(cluster,metric=uoptions["dist_metric"],metric_space=uoptions["buckets_metric"]
+				#																			,agg_function=uoptions["agg_function"],use_abs=uoptions["use_abs"])
+				(distance, combined_curve, buckets, partitioned_curve) = clusterRef.distance(cluster)
 				if distance < min_found:
 					min_found=distance
 					min_idx=(idx,i)
@@ -2347,9 +3280,12 @@ def get_kpart_schedule(workload,nr_ways,max_bandwidth=float('Inf')):
 
 		#Add merged cluster ...
 		curClusters.insert(0,new_cluster)
-		solutions.append((list(curClusters),determine_best_partitioning(curClusters,nr_ways,total_apps,max_bandwidth)))	
+		if uoptions["best_metric"] == "speedup":
+			solutions.append((list(curClusters), determine_best_partitioning(curClusters,nr_ways,total_apps,max_bandwidth)))
+		else:
+			solutions.append((list(curClusters), determine_best_partitioning_slowdown(curClusters, nr_ways, total_apps, max_bandwidth)))
 
-	## Determine BEST K
+
 	max_sp=-1
 	best_k=0
 
@@ -2361,19 +3297,163 @@ def get_kpart_schedule(workload,nr_ways,max_bandwidth=float('Inf')):
 			max_sp=sp_aggregate
 			best_k=idx
 
+	#assert sum(solutions[best_k][1][0])==nr_ways, "The algorithm is assigning all available ways to clusters"
+
+	return (solutions,best_k)
+
+def get_kpart_schedule_optimized(workload,nr_ways,max_bandwidth=float('Inf'),uoptions={}):
+	curClusters = []
+	total_apps = len(workload)	
+	
+	##Create distance matrix
+	distance_matrix=np.full((total_apps,total_apps),float('Inf'))
+
+	## Create lists for curves - triplets (combined_curve,buckets,partitioned_curve)
+	kpart_curves=[]
+	for i in range(total_apps):
+		row=[]
+		for j in range(total_apps):
+			row.append(None)
+		kpart_curves.append(row)
+
+
+	for i,app in enumerate(workload):
+		buckets = [[nw] for nw in range(1,nr_ways + 1)]
+		curve = app.get_metric_table("slowdown").values
+		## Supercritical
+		app.bench_id = i
+		cl=Cluster([app],curve,buckets)
+		curClusters.append(cl)
+
+	##Calculate initial distances and curves
+	for i,clusterRef in enumerate(curClusters):
+		idx_i=clusterRef.idx_cluster
+		for j in range(i+1,len(curClusters)):
+			cluster=curClusters[j]
+			idx_j=cluster.idx_cluster
+			(distance,combined_curve,buckets,partitioned_curve)=clusterRef.distance_gen(cluster,metric="slowdown",metric_space="llcmpkc",agg_function=raw_unfairness,use_abs=False)
+			##Store in matrices
+			distance_matrix[idx_i,idx_j]=distance
+			kpart_curves[idx_i][idx_j]=(combined_curve,buckets,partitioned_curve,clusterRef,cluster)
+
+	solutions = [(list(curClusters),determine_best_partitioning_slowdown(curClusters,nr_ways,total_apps,max_bandwidth))]
+	# (partitioning,per_app_partitioning,bw_app,sp_aggregate) <- determine_best_part()
+
+	it=1
+	while len(curClusters) > 1:
+
+		## Find min distance
+		min_i,min_j=np.unravel_index(distance_matrix.argmin(), distance_matrix.shape)
+		distance=distance_matrix[min_i,min_j]
+		(combined_curve,buckets,partitioned_curve,clusterA,clusterB)=kpart_curves[min_i][min_j]
+
+		##Determine location of prev_clusters (traverse all, it could be more efficient...)
+		min_idx=[0,0]
+		for idx,cluster in enumerate(curClusters):
+			if cluster.idx_cluster == clusterA.idx_cluster:
+				min_idx[0]=idx
+			elif cluster.idx_cluster == clusterB.idx_cluster:
+				min_idx[1]=idx
+
+		print "***Iteration %d***" % it
+		print distance_matrix
+		print distance
+		print "Selection:",clusterA,clusterB
+		print "***********************************"
+		it=it+1
+
+		## Merge 2 closest clusters
+		new_cluster=merge_clusters(clusterA,clusterB,combined_curve,buckets)
+
+		## Sorted is critical!
+		min_idx=sorted(min_idx)
+
+		## Remove prev clusters...
+		del curClusters[min_idx[0]]
+		del curClusters[min_idx[1]-1]
+
+		##One of the indexes is going away (the minimum one). Update the distance matrix to discard values in the future
+		removed_index=clusterA.idx_cluster if clusterA.idx_cluster>clusterB.idx_cluster else clusterB.idx_cluster
+		distance_matrix[removed_index,:]=float('Inf')
+		distance_matrix[:,removed_index]=float('Inf')
+
+		#Add merged cluster ...
+		curClusters.insert(0,new_cluster)
+		solutions.append((list(curClusters),determine_best_partitioning_slowdown(curClusters,nr_ways,total_apps,max_bandwidth)))	
+
+		## Calculate new distance if this is not the last iteration
+		if len(curClusters) > 1:
+			## Update distance info
+			##Calculate initial distances and curves
+			idx_new=new_cluster.idx_cluster
+
+			for cluster in curClusters:
+				if cluster.idx_cluster!=idx_new:
+					idx_other=cluster.idx_cluster
+					if (idx_new<idx_other):
+						(idx_i,idx_j)=(idx_new,idx_other)
+						(cluster_i,cluster_j)=(new_cluster,cluster)
+					else:
+						(idx_i,idx_j)=(idx_other,idx_new)
+						(cluster_i,cluster_j)=(cluster,new_cluster)
+		
+					(distance,combined_curve,buckets,partitioned_curve)=cluster_i.distance_gen(cluster_j,metric="slowdown",metric_space="llcmpkc",agg_function=raw_unfairness,use_abs=False)
+		
+					##Store in matrices
+					distance_matrix[idx_i,idx_j]=distance
+					kpart_curves[idx_i][idx_j]=(combined_curve,buckets,partitioned_curve,cluster_i,cluster_j)
+
+
+	## Determine BEST K
+	use_min=True
+	if use_min:
+		best_score=-float('Inf')
+	else:
+		best_score=float('Inf')
+	best_k=0
+
+	for (idx,sol) in enumerate(solutions):
+		(clusters,data)=sol
+		(partitioning,per_app_partitioning,bw_app,score)=data
+
+		if use_min and score < best_score:
+			best_score=score
+			best_k=idx
+		if not use_min and score > best_score:
+			best_score=score
+			best_k=idx
+
+	#assert sum(solutions[best_k][1][0])==nr_ways, "The algorithm is assigning all available ways to clusters"
+
 	return (solutions,best_k)
 
 
-def get_kpart_best_gen(workload,nr_ways,max_bandwidth=float('Inf'),debugging=False):
+
+def get_kpart_best_gen(workload,nr_ways,max_bandwidth=float('Inf'),debugging=False,variant=0,**kwargs):
+	kwargs.setdefault("dist_metric", "llcmpki")  # Curve distance /slowdown
+	kwargs.setdefault("buckets_metric", "llcmpki")  # Bucket's space distribution /llcmpkc
+	#kwargs.setdefault("ucp_metric", "llcmpki") # Metric to decide partitions' sizes /llcmpkc
+	kwargs.setdefault("use_abs", True) # Whether to use absolute value in distance calcs
+	kwargs.setdefault("agg_function", sum) # sum/max (function to use when the curves
+	kwargs.setdefault("best_metric", "speedup") # sp/stp/unf
+
+	if "user_options" in kwargs:
+		## Merge dict with user options... [Overriding defaults...]
+		kwargs.update(kwargs["user_options"])
+
 	## Invoke kpart.....
-	(solutions,k)=get_kpart_schedule(workload,nr_ways,max_bandwidth)
+	if variant==0:
+		(solutions,k)=get_kpart_schedule(workload,nr_ways,max_bandwidth,uoptions=kwargs)
+	else:
+		(solutions,k)=get_kpart_schedule_optimized(workload,nr_ways,max_bandwidth,uoptions=kwargs)
 
 	if debugging:
 		for sol in solutions:
 			clusters,(partitioning,per_app_partitioning,bw_app,sp_aggregate) = sol
 			bw_app = [(bw,app.name) for (bw,app) in bw_app]
-			(workload_alt,solution_alt)=zip(*per_app_partitioning)
-			print sp_aggregate, unfairness(list(workload_alt),list(solution_alt),max_bandwidth), clusters, partitioning, list(solution_alt)
+			print clusters, sp_aggregate
+			#(workload_alt,solution_alt)=zip(*per_app_partitioning)
+			#print sp_aggregate, unfairness(list(workload_alt),list(solution_alt),max_bandwidth), clusters, partitioning, list(solution_alt)
 		print "Best k =",k
 
 	best_sol=solutions[k]
@@ -2424,16 +3504,63 @@ def get_scaled_properties_cluster(cluster, max_ways, metric="llcmpkc"):
 		props=app.build_scaled_properties([b_ways[i] for b_ways in buckets])
 		hacked_apps.append(App(app.name,props,app))
 
-
 	return hacked_apps
+
+def write_rewind(fd, val):
+	os.write(fd,val)
+	os.lseek(fd,0,os.SEEK_SET)
+
+## Read pmc config to find nr_cos and nr_ways
+def read_pmc_config():
+	nr_cos = 0
+	nr_ways = 0
+	fd = open("/proc/pmc/config")
+	config = fd.read()
+	for line in config.split("\n"):
+		if "cat_nr_cos_available" in line:
+			nr_cos = int(line.split("cat_nr_cos_available")[1][1:])
+		if "llc_cbm0" in line:
+			all_ways_mask = line.split("=")[1]
+			nr_ways = len(bin(int(all_ways_mask,16)))-2
+	fd.close()
+	return (nr_cos,nr_ways)
+
+def get_user_assignment(workload,nr_ways,workload_name,**kwargs):
+	if "user_options" in kwargs:
+		## Merge dict with user options... [Overriding defaults...]
+		kwargs.update(kwargs["user_options"])
+	workloads_assignment = kwargs["user_assignment"]
+	w_id = int(workload_name.strip("W"))-1
+	if w_id > len(workloads_assignment):
+		print "Your user-sched file has not enough workloads specified w.r.t. your workload.csv file"
+		exit(1)
+	(per_app_ways,per_app_masks,cluster_id) = workloads_assignment[w_id]
+
+	patched_workload=[None]*len(per_app_ways)
+	for cl_ix in range(len(cluster_id)):
+		# Get the corresponding indexes of this cluster to get the specific apps in the workload
+		cl_apps_ixs = [i for i,clust_i in enumerate(cluster_id) if clust_i==cl_ix]
+		# Obtain the apps in the workload of this cluster
+		clust_apps = [workload[app_ix] for app_ix in cl_apps_ixs]
+		# Re build scaled apps to return the result and be able to obtain the performance metrics
+		scaled_apps = get_scaled_properties_cluster(clust_apps, nr_ways)
+		# Rebuild patched workload
+		for i in range(len(cl_apps_ixs)):
+			patched_workload[cl_apps_ixs[i]] = scaled_apps[i]
+
+	return (patched_workload,per_app_ways,per_app_masks,cluster_id)
+
 
 if __name__ == "__main__":
 #	l=[c for c in generate_possible_clusters(["A","B","C","D","E"],3)]
 #	print l
 #	print len(l)
 #	exit(0)
-	write_dot_tree(6,4)
-	#print determine_number_of_cluster_cache_partitioning(20,20)	
+	#bb_generate_solutions_to_explore(20,6,28)
+	subnodes=bb_break_into_subnodes([2],4,20,5)
+	print subnodes
+	#write_dot_tree(6,4)
+	#print determine_number_of_cluster_cache_partitioning(20,20)
 	#nsols=number_of_solutions_partitioning_dp(11,4)		
 	#solutions=[[[1]]]
 	#sols=unroll_solutions(nsols,11,4,10000,solutions)	

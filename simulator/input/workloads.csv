@@ -1,3 +1,6 @@
-bwaves06,zeusmp06,xalancbmk06
-lbm06,lbm06,libquantum06,gobmk06
-lbm06,mcf06,mcf06,xalancbmk06,libquantum06
+sphinx306,lbm06,libquantum06,applu00,soplex06,milc06
+bzip206,equake00,swim00,omnetpp06,applu00,gobmk06
+hmmer06,gamess06,bwaves06,gobmk06,astar06,libquantum06
+namd06,hmmer06,gamess06,bwaves06,soplex06,libquantum06
+omnetpp06,lbm06,sphinx306,hmmer06,vortex00,h264ref06
+GemsFDTD06,leslie3d06,cactusADM06,soplex06,povray06

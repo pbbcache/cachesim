@@ -22,6 +22,9 @@ from simulator_core import *
 import datetime
 import pytz
 
+# Function that applies the UCP algorithm to an array of clusters
+# Params: Array of clusters
+# Return: UCP solution (lookahead algorithm)
 def ucp_clustering_solution(clustering,nr_ways):
 	## Weighted
 	slowdown_curves=[]
@@ -38,12 +41,17 @@ def ucp_clustering_solution(clustering,nr_ways):
 
 	return lookahead_algorithm_gen(slowdown_curves,nr_ways)
 
-
+# Function that returns the app and cluster names
+# Params: Array of apps and clusters
+# Return: Tuple with apps and cluster names as strings
 def plain_names(apps,cluster):
 	n_apps=map(lambda x: x.name,apps)
 	n_cluster=map(lambda c:(map(lambda x: x.name,c)),cluster)
 	return n_apps,n_cluster
 
+# Function that builds an array of clusters from an specific workload and an array of app assignments to clusters
+# Params: Numeric cluster IDs and array of apps
+# Return: Array of clusters
 def get_application_clustering_from_app_ids(numeric_clustering,workload):
 	clustering=[]
 	for nclust in numeric_clustering:
@@ -51,6 +59,9 @@ def get_application_clustering_from_app_ids(numeric_clustering,workload):
 		clustering.append(cluster)
 	return clustering
 
+# Function that scales down the metric tables of each cluster in an array to a specific number of ways
+# Params: Array of clusters and number of ways
+# Return: Scaled clusters and apps
 def get_patched_clustering_and_workload(clustering,nr_ways):
 	patched_apps=[]
 	patched_clustering=[]	
@@ -62,8 +73,8 @@ def get_patched_clustering_and_workload(clustering,nr_ways):
 
 	return (patched_clustering,patched_apps)
 
-##Return: Best cost and best part solution for the clustering (no patched apps).
-def determine_optimal_partitioning_for_clustering(num_clustering, workload, cost_function, max_bandwidth, best_cost, maximize, nr_ways , uoptions, multiprocessing=False,**kwargs):
+# Function that calculates the best cost and best part solution for the clustering (no patched apps).
+def determine_optimal_partitioning_for_clustering(num_clustering, workload, cost_function, max_bandwidth, best_cost, maximize, nr_ways , uoptions, multiprocessing=False,use_bf=True,**kwargs):
 
 	## Transform low-level numeric representation into list of lists of object
 	clustering=get_application_clustering_from_app_ids(num_clustering,workload)
@@ -103,7 +114,10 @@ def determine_optimal_partitioning_for_clustering(num_clustering, workload, cost
 		uopts["initial_bound"]=best_cost
 
 		## Determine optimal partitioning for that clustering 
-		(local_cost,local_solution,local_branches,metadata)=get_optimal_schedule((patched_apps,patched_clustering),cost_function,maximize,nr_ways,max_bandwidth,user_options=uopts)
+		if use_bf:
+				(local_cost,local_solution,local_branches,metadata)=get_optimal_schedule_bf((patched_apps,patched_clustering),cost_function,maximize,nr_ways,max_bandwidth,user_options=uopts)
+		else:
+				(local_cost,local_solution,local_branches,metadata)=get_optimal_schedule((patched_apps,patched_clustering),cost_function,maximize,nr_ways,max_bandwidth,user_options=uopts)
 
 		if local_solution is None:
 			return (best_cost,best_solution,local_branches) ## UCP is the best
@@ -111,7 +125,6 @@ def determine_optimal_partitioning_for_clustering(num_clustering, workload, cost
 			return (local_cost,local_solution,local_branches)
 
 		return (local_cost,local_solution,local_branches)
-
 
 ## Multiprocessor wrapper
 def determine_optimal_partitioning_for_clustering_mp(num_clustering, best_cost):
@@ -123,6 +136,18 @@ def determine_optimal_partitioning_for_clustering_mp(num_clustering, best_cost):
 
 	return determine_optimal_partitioning_for_clustering(**params)
 
+## Multiprocessor wrapper with arguments as tuple
+def determine_optimal_partitioning_for_clustering_mp2(arg):
+	(num_clustering, best_cost)=arg
+	params=get_global_properties()
+	## Force sequential execution
+	params["multiprocessing"]=False
+	params["best_cost"]=best_cost
+	params["num_clustering"]=num_clustering
+
+	return determine_optimal_partitioning_for_clustering(**params)
+
+# Function that goes through an array of solutions and decides which one is best to be returned
 def reduce_solutions(clusts, sols, op, best_solution , best_cost, total_branches):
 	
 	for i,sol in enumerate(sols):
@@ -142,6 +167,103 @@ def reduce_solutions(clusts, sols, op, best_solution , best_cost, total_branches
 
 	return (best_solution,best_cost, total_branches)
 
+# Function that normalizes the output for a given clustering solution
+def normalize_output_for_clustering_solution(workload,clusters,clustering_sol,nr_ways):
+	for i,app in enumerate(workload):
+		app.bench_id = i
+		
+	## Calculate patched apps and so on
+	(patched_clustering,patched_apps)=get_patched_clustering_and_workload(clusters,nr_ways)
+
+	## Build per cluster masks
+	per_cluster_masks=get_partition_masks(clustering_sol)
+
+	per_app_masks = [None] * len(patched_apps)
+	per_app_ways = [None] * len(patched_apps)
+	cluster_ids = [None] * len(patched_apps)
+	patched_workload=[None]*len(patched_apps)
+
+	## Build per app ways and per app masks
+	for i,cluster in enumerate(patched_clustering):
+		cluster_ways=clustering_sol[i]
+		cluster_mask=per_cluster_masks[i]
+		for app in cluster:
+			orig_i = app.original_app.bench_id
+			per_app_ways[orig_i] = cluster_ways
+			per_app_masks[orig_i] = cluster_mask
+			cluster_ids[orig_i] = i
+
+	for app in patched_apps:
+		orig_i = app.original_app.bench_id
+		#print orig_i,app
+		patched_workload[orig_i] = app
+
+	return (patched_workload,per_app_ways,per_app_masks,cluster_ids)
+
+# Function to process the exploration results and update the upper bound if a better solution is found
+def clustering_process_result(task,clust,props,op):
+	if task.cancelled():
+		return False
+
+	#node_queue
+	#lb_queue
+	ub=props["upper_bound"]
+	total_nodes=props["total_nodes"]
+	better_solution=True
+
+	## Get result
+	(this_cost,this_sol,node_count)=task.get()
+
+	## Get metadata
+	if "trace" in props:
+		add_trace_item(props["trace"],task.metadata,props["start_datet"],"1",include_master=True)
+
+	## Update global node count 
+	props["total_nodes"]=total_nodes+node_count
+
+	## Found a better solution
+	if (not this_sol is None) and op(this_cost, ub):
+			## Update dict as well
+			props["upper_bound"] = this_cost
+			## Better solution includes the numeric clustering spec
+			props["incumbent"] =  (clust, this_sol)
+			#print "New solution found:", this_sol,this_cost
+			better_solution=True
+
+	return better_solution
+
+# Function to process pending tasks and mark them to be deleted if they have been completed or if they are no longer better that a new upper bound
+def clust_process_pending(pending_tasks, num_clusts, clust_props,op, completed=None):
+	## Traverse pending tasks
+	i=0
+	deleted=0
+	better_solution_found=False
+
+	if completed is None:
+		## First stage (check pending tasks that completed)
+		for task in pending_tasks[:]:
+			if task.ready():
+				if clustering_process_result(task,num_clusts[i],clust_props,op):
+					better_solution_found=True
+				pending_tasks.remove(task)	
+				del num_clusts[i]	
+				deleted=deleted+1
+				#print "task", i, "completed. Removing from list"	
+			else:
+				i=i+1
+	else:
+		for task in completed:
+			i=pending_tasks.index(task)
+			if i==-1 or not task.ready():
+				print "Error"
+				exit(1)
+			if clustering_process_result(task,clust_props,op):
+				better_solution_found=True
+			del pending_tasks[i]	
+			del num_clusts[i]	
+			deleted=deleted+1
+
+	return deleted
 
 
 # Public function that calculates best clustering solution for workload passed as a parameter
@@ -162,7 +284,6 @@ def get_optimal_clustering(workload, cost_function, maximize, nr_ways, max_bandw
 		## Merge dict with user options... [Overriding defaults...]
 		kwargs.update(uoptions)
 
-
 	async=kwargs["async"]
 	chunk=kwargs["chunk"]
 	sol_threshold=kwargs["sol_threshold"]
@@ -173,7 +294,6 @@ def get_optimal_clustering(workload, cost_function, maximize, nr_ways, max_bandw
 	for i,app in enumerate(workload):
 		app.bench_id = i
 
-
 	if not async:
 		paraver=False
 
@@ -183,6 +303,8 @@ def get_optimal_clustering(workload, cost_function, maximize, nr_ways, max_bandw
 		start = datetime.datetime.utcnow()
 		unlocalized_start = pytz.utc.localize(datetime.datetime.utcnow())
 		start_datet = unlocalized_start.astimezone(pytz.timezone("utc"))
+		# States: 1 Blue(Parallel left over), 6 Light green (Parallel tasks), 7 Yellow (sequential)
+		# 9 Dark green (Reductions), 13 Orange, 15 (Ugly green)
 
 	# Determine right operator
 	op = operator.gt if maximize else operator.lt
@@ -196,13 +318,15 @@ def get_optimal_clustering(workload, cost_function, maximize, nr_ways, max_bandw
 	## Determine table with number of solutions to drive execution
 	nsols=number_of_solutions_partitioning_dp(nr_ways,len(workload))
 
-	## Start connection right away
-	rc = ipp.Client(timeout=30000) #debug=True)
-	nr_engines=len(rc.ids)
 
-	## Copy global data
-	dview = rc[:]
-	dict_globals={"workload": workload,
+	if multiprocessing:
+		## Start connection right away
+		rc = ipp.Client(timeout=30000) #debug=True)
+		nr_engines=len(rc.ids)
+
+		## Copy global data
+		dview = rc[:]
+		dict_globals={"workload": workload,
 				  "cost_function": cost_function,
 				  "max_bandwidth": max_bandwidth,
 				  "nr_ways": nr_ways,
@@ -210,28 +334,19 @@ def get_optimal_clustering(workload, cost_function, maximize, nr_ways, max_bandw
 				  "uoptions": uoptions,
 				  "multiprocessing": False,
 				  "bw_model": kwargs["bw_model"]}
-	# Copy global data
-	ret=dview.apply_sync(lambda x: set_global_properties(x),dict_globals)
+		# Copy global data
+		ret=dview.apply_sync(lambda x: set_global_properties(x),dict_globals)
 
-	lview = rc.load_balanced_view()
-	lview.block = not async
+		lview = rc.load_balanced_view()
+		lview.block = not async
 
 	work_to_do=0
 	tasks=[]
 
-	if paraver:
-		end = datetime.datetime.utcnow()
-		(start_micros, end_micros) = get_start_end_micros(start, end, start_datet)
-		trace.append(["1", "1", "1", "1", "1", str(start_micros), str(end_micros), "7"])
-		expand_iterator_start_t = end
-
 	for num_clustering in iterator:
-		if paraver:
-			now = datetime.datetime.utcnow()
-			(start_micros, end_micros) = get_start_end_micros(expand_iterator_start_t, now, start_datet)
-			trace.append(["1", "1", "1", "1", "1", str(start_micros), str(end_micros), "13"])
 		# Filter based on the number of solutions
 		number_solutions=nsols[nr_ways-1][len(num_clustering)-1]
+
 
 		if multiprocessing and number_solutions>=sol_threshold:
 			## Do it later 
@@ -239,7 +354,13 @@ def get_optimal_clustering(workload, cost_function, maximize, nr_ways, max_bandw
 			work_to_do+=1
 
 			if work_to_do>=nr_engines*chunk:
-				# Do it
+
+				if paraver:
+					end = datetime.datetime.utcnow()
+					(start_micros, end_micros) = get_start_end_micros(start, end, start_datet)
+					trace.append(["1", "1", "1", "1", "1", str(start_micros), str(end_micros), "7"])
+
+				# Send tasks to load balanced cluster
 				sols= lview.map(lambda x: determine_optimal_partitioning_for_clustering_mp(x,best_cost),tasks)
 
 				if async:
@@ -260,36 +381,16 @@ def get_optimal_clustering(workload, cost_function, maximize, nr_ways, max_bandw
 				## Clear list for next time
 				work_to_do=0
 				tasks=[]
-				if paraver:
-					end = datetime.datetime.utcnow()
-					(start_micros, end_micros) = get_start_end_micros(start, end, start_datet)
-					trace.append(["1", "1", "1", "1", "1", str(start_micros), str(end_micros), "15"])
 		else:
-			if paraver:
-				start = datetime.datetime.utcnow()
-			## Do it now
 			## Get optimal partitioning for that clustering solution
 			(local_cost,local_solution,local_branches)=determine_optimal_partitioning_for_clustering(num_clustering, workload, cost_function, max_bandwidth, best_cost, maximize, nr_ways , uoptions, multiprocessing=False)
 			total_branches+=local_branches
 
-			if local_solution is None:
-				continue
-
-			## Decide wether to pick this one or the previous one
-			if  best_solution is None or op(local_cost, best_cost):
-				best_cost=local_cost
-				best_solution=(num_clustering,local_solution) #(patched_apps,patched_clustering,local_solution)
-			#print "Best solution found seq:", best_solution, best_cost, total_branches
-			if paraver:
-				end = datetime.datetime.utcnow()
-				(start_micros, end_micros) = get_start_end_micros(start, end, start_datet)
-				trace.append(["1", "1", "1", "1", "1", str(start_micros), str(end_micros), "15"])
-		if paraver:
-			expand_iterator_start_t = datetime.datetime.utcnow()
-
-	#now = datetime.datetime.utcnow()
-	#(start_micros, end_micros) = get_start_end_micros(expand_iterator_start_t, now, start_datet)
-	#trace.append(["1", "1", "1", "1", "1", str(start_micros), str(end_micros), "13"])
+			if local_solution:
+				## Decide wether to pick this one or the previous one
+				if  best_solution is None or op(local_cost, best_cost):
+					best_cost=local_cost
+					best_solution=(num_clustering,local_solution) #(patched_apps,patched_clustering,local_solution)
 
 	## Do remaining work (last iteration)
 	if work_to_do>0:
@@ -326,42 +427,16 @@ def get_optimal_clustering(workload, cost_function, maximize, nr_ways, max_bandw
 		metadatum["header"] = header_str
 		metadatum["trace"] = trace
 
-
 	##Prepare output... (Sorted maybe later)
 	(num_clustering,clustering_sol)=best_solution
 	#(patched_apps,patched_clustering,clustering_sol)=best_solution
 
 	## Redo interpolation
 	clustering=get_application_clustering_from_app_ids(num_clustering,workload)
-	(patched_clustering,patched_apps)=get_patched_clustering_and_workload(clustering,nr_ways)
 
-	## Build per cluster masks
-	per_cluster_masks=get_partition_masks(clustering_sol)
-
-	per_app_masks = [None] * len(patched_apps)
-	per_app_ways = [None] * len(patched_apps)
-	cluster_ids = [None] * len(patched_apps)
-	patched_workload=[None]*len(patched_apps)
-
-	## Build per app ways and per app masks
-	for i,cluster in enumerate(patched_clustering):
-		cluster_ways=clustering_sol[i]
-		cluster_mask=per_cluster_masks[i]
-		for app in cluster:
-			orig_i = app.original_app.bench_id
-			per_app_ways[orig_i] = cluster_ways
-			per_app_masks[orig_i] = cluster_mask
-			cluster_ids[orig_i] = i
-
-	for app in patched_apps:
-		orig_i = app.original_app.bench_id
-		#print orig_i,app
-		patched_workload[orig_i] = app
+	(patched_workload,per_app_ways,per_app_masks,cluster_ids)=normalize_output_for_clustering_solution(workload,clustering,clustering_sol,nr_ways)
 
 	return (patched_workload,per_app_ways,per_app_masks,cluster_ids,total_branches,metadatum)
-
-
-
 
 # Public function that calculates best clustering solution for workload passed as a parameter
 # Params: workload (array of Apps), cost function, maximize or not, slots available, max bandwidth, multiprocessing or sequential mode and activate pruning (bound) or not.
@@ -374,7 +449,6 @@ def get_optimal_clustering_seq(workload, cost_function, maximize, nr_ways, max_b
 	if uoptions:
 		## Merge dict with user options... [Overriding defaults...]
 		kwargs.update(uoptions)
-
 
 # Determine right operator
 	op = operator.gt if maximize else operator.lt
@@ -437,7 +511,7 @@ def get_optimal_clustering_seq(workload, cost_function, maximize, nr_ways, max_b
 			best_cost=local_cost
 			best_solution=(patched_apps,patched_clustering,local_solution)
 
-	##Prepare output... (Sorted maybe later)
+	## Prepare output
 	(patched_apps,patched_clustering,clustering_sol)=best_solution
 
 	## Build per cluster masks
@@ -454,9 +528,168 @@ def get_optimal_clustering_seq(workload, cost_function, maximize, nr_ways, max_b
 			per_app_masks.append(cluster_mask)
 			cluster_ids.append(i)
 
-	##Masks...
 	return (patched_apps,per_app_ways,per_app_masks,cluster_ids,total_branches)
 
 
+# Public function that calculates best clustering solution for workload passed as a parameter
+# Params: workload (array of Apps), cost function, maximize or not, slots available, max bandwidth, multiprocessing or sequential mode and activate pruning (bound) or not.
+# Return: Best cost and best solution for the workload.
+def get_optimal_clustering_bf(workload, cost_function, maximize, nr_ways, max_bandwidth=float('Inf'), multiprocessing=False,**kwargs):
+
+	## Set defaults
+	kwargs.setdefault("user_options",None)
+	kwargs.setdefault("sol_threshold", 20)
+	kwargs.setdefault("paraver",False)
+	kwargs.setdefault("bw_model","simple")
+	kwargs.setdefault("dyn_load_factor",2)
+	kwargs.setdefault("paraver",False)
+	kwargs.setdefault("debug",False)
+	kwargs.setdefault("print_times",False)
+
+	uoptions=kwargs["user_options"]
+
+	if uoptions:
+		## Merge dict with user options... [Overriding defaults...]
+		kwargs.update(uoptions)
+
+	pq=[] ## Clustering queue
+	num_clusts=[] ## Numeric clusters (for later recomposition)
+	pending_tasks=[]
+	
+	sol_threshold=kwargs["sol_threshold"]
+	paraver=kwargs["paraver"]
+	dyn_load_factor= kwargs["dyn_load_factor"]
+	print_times=kwargs["print_times"]
+	debug=kwargs["debug"]
+	log_enabled=paraver or print_times
+
+	metadatum = {}
+
+	reset_completion_variables()
+
+	clust_props= { "node_queue": pq,
+							"num_clusts": num_clusts,
+						"upper_bound": None,
+						"incumbent": None,
+						"total_nodes":0}
+
+	if log_enabled:
+		trace=[]
+		start_datet=generate_start_datet()
+		start=get_trace_timestamp()	
+		clust_props["trace"]=trace
+		clust_props["start_datet"]=start_datet	
+
+	for i,app in enumerate(workload):
+		app.bench_id = i
 
 
+	# Determine right operator
+	op = operator.gt if maximize else operator.lt
+
+	iterator=generate_possible_clusters(range(len(workload)),nr_ways)
+
+	## Determine table with number of solutions to drive execution
+	nsols=number_of_solutions_partitioning_dp(nr_ways,len(workload))
+
+	## Start connection right away
+	rc = ipp.Client(timeout=30000) #debug=True)
+	nr_engines=len(rc.ids)
+
+	## Copy global data
+	dview = rc[:]
+	dict_globals={"workload": workload,
+			  "cost_function": cost_function,
+			  "max_bandwidth": max_bandwidth,
+			  "nr_ways": nr_ways,
+			  "maximize": maximize,
+			  "uoptions": uoptions,
+			  "multiprocessing": False,
+			  "use_bf": True, ## New parameter to force usage of best-first algorithm
+			  "bw_model": kwargs["bw_model"]}
+	# Copy global data
+	ret=dview.apply_sync(lambda x: set_global_properties(x),dict_globals)
+
+	lview = rc.load_balanced_view()
+	lview.block = False
+
+	## Populate 
+	limit_queue=dyn_load_factor*nr_engines 
+
+	for num_clustering in iterator:
+		## While saturated queue
+		while len(pq)>limit_queue:
+			tasks_submitted=0
+
+			## Send everything that we have until a certain limit
+			while pq and len(pending_tasks)<=limit_queue:
+				clust=pq.pop(0)
+				task = lview.apply_async(determine_optimal_partitioning_for_clustering_mp2, (clust,clust_props["upper_bound"]))
+
+				## Same callback as asynchronous stuff
+				task.add_done_callback(bb_task_completed)	
+
+				## Add pending task plus argument
+				pending_tasks.append(task)
+				num_clusts.append(clust)
+
+				tasks_submitted=tasks_submitted+1	
+
+			if tasks_submitted==0 and pending_tasks:
+				if log_enabled:
+					add_trace_seq_item(trace,start,get_trace_timestamp(),start_datet,"7")
+
+				completed=wait_until_task_completed()
+				if log_enabled:
+					start=get_trace_timestamp()
+				if len(completed)>0:
+					clust_process_pending(pending_tasks, num_clusts, clust_props, op) # completed)
+
+		## Enqueue new task if not a small B&B
+		# Filter based on the number of solutions
+		number_solutions=nsols[nr_ways-1][len(num_clustering)-1]
+
+		if number_solutions>sol_threshold:
+			## Do it later 
+			pq.append(num_clustering)
+		else:
+			## Get optimal partitioning for that clustering solution
+			(local_cost,local_solution,local_branches)=determine_optimal_partitioning_for_clustering(num_clustering, workload, cost_function, max_bandwidth, clust_props["upper_bound"], maximize, nr_ways , uoptions, multiprocessing=False, use_bf=True)
+			clust_props["total_nodes"]=clust_props["total_nodes"]+local_branches
+
+			if not local_solution is None:
+				## Update incumbent and cost
+				clust_props["upper_bound"] = local_cost
+				clust_props["incumbent"] =(num_clustering,local_solution)
+				if debug:
+					print "New solution found:", new_solution, this_cost 
+
+	## Process pending tasks
+	while pending_tasks:
+		if log_enabled:
+			add_trace_seq_item(trace,start,get_trace_timestamp(),start_datet,"7")
+
+		completed=wait_until_task_completed()
+		
+		if log_enabled:
+			start=get_trace_timestamp()
+		if len(completed)>0:
+			clust_process_pending(pending_tasks, num_clusts, clust_props, op) 	
+
+	rc.close()
+
+	(num_clustering,clustering_sol)=clust_props["incumbent"]
+
+	## Redo interpolation
+	clustering=get_application_clustering_from_app_ids(num_clustering,workload)
+
+	(patched_workload,per_app_ways,per_app_masks,cluster_ids)=normalize_output_for_clustering_solution(workload,clustering,clustering_sol,nr_ways)
+
+	if log_enabled:
+		add_trace_seq_item(trace,start,get_trace_timestamp(),start_datet,"7")
+		metadatum["header"]=generate_paraver_header(start_datet,nr_engines+1)
+		metadatum["trace"]=trace
+
+	return (patched_workload,per_app_ways,per_app_masks,cluster_ids,clust_props["total_nodes"],metadatum)
+
+		

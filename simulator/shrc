@@ -1,0 +1,5 @@
+export PYTHONPATH=$PWD/common:$PYTHONPATH
+
+if [ "$PBBCACHE" == "" ]; then
+	export PBBCACHE=$PWD
+fi
