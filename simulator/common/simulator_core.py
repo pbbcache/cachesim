@@ -295,15 +295,22 @@ class App:
 		ipc_ref=self.original_app.properties["ipc"][nr_ways_fair]
 		return 	(self.properties["ipc"]*(self.scaling_factor/ipc_ref)).sort_index()
 
-	## Scaled ways is a python list of floats 
-	## (proportional ways in cluster the application belongs to )
-	def build_scaled_properties(self,scaled_ways):
+	def build_scaled_properties(self,scaled_ways,metrics=[]):
 		## Work with original app!!!
-		float_df = pd.DataFrame()
-		bdf=self.original_app.properties.drop("BENCH",axis=1)
+		#start= time.time()
+
+		if metrics:
+			bdf = self.original_app.properties.loc[:, metrics]
+		else:
+			bdf = self.original_app.properties.drop("BENCH",axis=1)
+
+		# Initiallize dict to create df
+		res_dict = {c:[] for c in bdf.columns}
+		res_dict["float_ways"] = []
 		# Build zero interpolation
 		projected_values = bdf.ix[1]+(bdf.ix[1]-bdf.ix[2])
 		projected_values = projected_values.apply(lambda x: 0.000001 if x<=0 else x)
+		float_ways = []
 		for cur_ways in range(len(scaled_ways)):
 			f_ways = scaled_ways[cur_ways]
 			i_act = int(f_ways)
@@ -314,8 +321,18 @@ class App:
 			else: # Weighted average
 				new_row = (1-frac)*bdf.loc[i_act] + frac*bdf.loc[i_next]
 			new_row["float_ways"] = f_ways
-			float_df=float_df.append(new_row,ignore_index=True)
-		float_df.index+=1
+			for c in new_row.index:
+				res_dict[c].append(new_row[c])
+
+		float_df = pd.DataFrame(res_dict,index=[i+1 for i in range(len(res_dict["float_ways"]))])
+
+		#end = time.time()
+		#sim_time = str(round(end - start, 4))
+		#print "Build_props time: %s" % sim_time
+		#print "fl_df: %s" % float_df.columns
+		#print "fl_df: %s" % scaled_ways
+
+
 		return float_df
 
 def get_slowdown_vector_old(benchmark_list, solution, max_bandwidth=float('Inf')):
@@ -3113,7 +3130,6 @@ class Cluster:
 		return self.distance_gen(cluster2,metric="slowdown",metric_space="llcmpkc",agg_function=max,use_abs=False)
 
 	def get_cluster_speedup_curve(self,nr_ways,total_apps,max_bandwidth):
-		speedup_curves=[]
 		nr_ways_equal=int(round(nr_ways/total_apps))
 		# Now each app has stored the proportional metrics values to the float ways
 		sp=[]
@@ -3501,7 +3517,8 @@ def get_scaled_properties_cluster(cluster, max_ways, metric="llcmpkc"):
 	comb_mrc,buckets = whirlpool_combine_ncurves_f(curves,max_ways)
 	hacked_apps=[]
 	for i,app in enumerate(cluster):
-		props=app.build_scaled_properties([b_ways[i] for b_ways in buckets])
+	## Potential optimization in reducing the number of metrics
+		props=app.build_scaled_properties([b_ways[i] for b_ways in buckets], []) #["ipc","llcmpki","llcmpkc","slowdown"])
 		hacked_apps.append(App(app.name,props,app))
 
 	return hacked_apps
