@@ -222,7 +222,7 @@ def clustering_process_result(task,clust,props,op):
 	props["total_nodes"]=total_nodes+node_count
 
 	## Found a better solution
-	if (not this_sol is None) and op(this_cost, ub):
+	if (not this_sol is None) and ((props["incumbent"]  is None) or op(this_cost, ub)):
 			## Update dict as well
 			props["upper_bound"] = this_cost
 			## Better solution includes the numeric clustering spec
@@ -316,7 +316,7 @@ def get_optimal_clustering(workload, cost_function, maximize, nr_ways, max_bandw
 	total_branches=0
 
 	## Determine table with number of solutions to drive execution
-	nsols=number_of_solutions_partitioning_dp(nr_ways,len(workload))
+	nsols=number_of_solutions_partitioning_dp(nr_ways, min(len(workload),nr_ways))
 
 
 	if multiprocessing:
@@ -538,7 +538,7 @@ def get_optimal_clustering_bf(workload, cost_function, maximize, nr_ways, max_ba
 
 	## Set defaults
 	kwargs.setdefault("user_options",None)
-	kwargs.setdefault("sol_threshold", 20)
+	kwargs.setdefault("sol_threshold", 0)
 	kwargs.setdefault("paraver",False)
 	kwargs.setdefault("bw_model","simple")
 	kwargs.setdefault("dyn_load_factor",2)
@@ -590,7 +590,7 @@ def get_optimal_clustering_bf(workload, cost_function, maximize, nr_ways, max_ba
 	iterator=generate_possible_clusters(range(len(workload)),nr_ways)
 
 	## Determine table with number of solutions to drive execution
-	nsols=number_of_solutions_partitioning_dp(nr_ways,len(workload))
+	nsols=number_of_solutions_partitioning_dp(nr_ways, min(len(workload),nr_ways))
 
 	## Start connection right away
 	rc = ipp.Client(timeout=30000) #debug=True)
