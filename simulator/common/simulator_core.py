@@ -295,6 +295,9 @@ class App:
 		ipc_ref=self.original_app.properties["ipc"][nr_ways_fair]
 		return 	(self.properties["ipc"]*(self.scaling_factor/ipc_ref)).sort_index()
 
+	## Scaled ways is a python list of floats
+	## (proportional ways in cluster the application belongs to )
+	# metrics for Kpart: "bandwidth_mbps","ipc","slowdown","llcmpki"
 	def build_scaled_properties(self,scaled_ways,metrics=[]):
 		## Work with original app!!!
 		#start= time.time()
@@ -1901,7 +1904,7 @@ def get_optimal_schedule_bf_seq(benchmark_set, cost_function, max_bandwidth, def
 					## Enqueue
 					bb_insert_node(pq,lb,new_partial_solution,key=this_lower_bound)
 
-		
+			depth_first = True
 		if leaf_node and op(this_cost, best_cost):
 			best_cost = this_cost
 			best_solution = partial_solution
@@ -1913,6 +1916,151 @@ def get_optimal_schedule_bf_seq(benchmark_set, cost_function, max_bandwidth, def
 					pq.pop()
 				else:
 					break ## Sorted list!
+
+	return (best_cost, best_solution, total_nodes_expanded)
+
+
+## Maintain separate lists for lbs and nodes; depths to control indexing
+def bb_insert_node_hyb(pq, lbs, d_pq, d_lb, d_depths, item, lb):
+	"""
+	key is now the depth of the node
+	lb is the extra argument to insert in lbs
+	item is the node (sol/partial_sol)
+	"""
+	i = bisect_left(lbs, lb)  # Determine where to insert item.
+	pq.insert(i, item)  # Insert the item itself in the corresponding place.
+	lbs.insert(i, lb)
+
+	depth = -(len(item))
+	j = bisect_left(d_depths, depth)
+	d_depths.insert(j, depth)  # Insert key of item to keys list.
+	d_pq.insert(j, item)  # Insert the item itself in the corresponding place.
+	d_lb.insert(j, lb)
+
+def bb_pop_first_node_hyb(pq, lbs, d_pq, d_lb, d_depths, depth_first):
+	if depth_first:
+		# Obtain first element from the depth ordered
+		partial_solution = d_pq.pop(0)
+		d_lb.pop(0)
+		d_depths.pop(0)
+		ix = pq.index(partial_solution)
+		pq.pop(ix)
+		lbs.pop(ix)
+	else:
+		partial_solution = pq.pop(0)
+		lbs.pop(0)
+		jx = d_pq.index(partial_solution)
+		d_pq.pop(jx)
+		d_lb.pop(jx)
+		d_depths.pop(jx)
+	return partial_solution
+
+def purge_unpromising(pq, lbs, d_pq, d_lb, d_depths, best_cost, op):
+	## Purge unpromising nodes in the depth queue
+	i = len(d_lb) - 1
+	for lower_bound in reversed(d_lb):
+		if not op(lower_bound, best_cost):
+			sol = d_pq.pop(i)
+			d_depths.pop(i)
+			d_lb.pop(i)
+			ix = pq.index(sol)
+			pq.pop(ix)
+			lbs.pop(ix)
+		i -= 1
+
+
+## Extra parameter lower bounds
+def get_optimal_schedule_bf_seq_hybrid(benchmark_set, cost_function, max_bandwidth, default_cost, op, total_nr_ways,
+								partial_solutions, lower_bounds, bound):
+	# To determine n_clusters
+	if type(benchmark_set) is list:
+		cluster_list = benchmark_set
+	else:
+		cluster_list = benchmark_set[1]  ## Use cluster rather than that
+
+	n_clusters = len(cluster_list)
+
+	depth_first = False
+	first_division = False
+
+	# Indexed by depth
+	d_pq = []  ## Priority queue
+	d_lb = []  ## Lower bound associated with prio queue
+	d_depths = [] ## Depth list so the depth of each item is tracked so the other lists are indexed
+	# Indexed by lb
+	pq = []
+	lbs = []
+
+	best_cost = default_cost
+	best_solution = None
+	total_nodes_expanded = 0
+
+	## Need to insert root of the tree
+	if len(partial_solutions) == 0:
+		d_pq.append([])
+		d_lb.append(1)  ## It does not really matter
+		d_depths.append(0)
+		pq.append([])
+		lbs.append(1)
+		total_nodes_expanded = 1
+	else:
+		## Transfer solutions thus far to pool
+		for i in range(len(partial_solutions)):
+			bb_insert_node_hyb(pq, lbs, d_pq, d_lb, d_depths, partial_solutions[i], lower_bounds[i])
+
+	## While list is not empty
+	while (pq):
+		partial_solution = bb_pop_first_node_hyb(pq, lbs, d_pq, d_lb, d_depths, depth_first)
+		nr_ways = total_nr_ways - sum(partial_solution)
+		## We visit a new node
+
+		level = len(partial_solution)
+		leaf_node = False
+
+		# Wait until we visit a node in the second level with best-first to start DF to arrive to the leaves
+		if level > 1:
+			first_division = True
+		# After chosing the next node with BF we enable depth_first to arrive faster to a leaf (update upper bound more freq.)
+		if first_division and not depth_first:
+			depth_first = True
+
+		if level == n_clusters - 1:  # Trivial Base case
+			partial_solution.append(nr_ways)  # Being the last app, we give you all the available 'slots'
+			this_cost = cost_function(benchmark_set, partial_solution, max_bandwidth)
+			leaf_node = True
+			total_nodes_expanded += 1
+		elif nr_ways == n_clusters - level:  ## Optimization, one way for each app....
+			##Easy ...
+			for i in range(nr_ways):
+				partial_solution.append(1)
+			this_cost = cost_function(benchmark_set, partial_solution, max_bandwidth)
+			leaf_node = True
+			total_nodes_expanded += 1
+		else:
+			# Non leaf node
+			for nr_ways_assigned in range(1, nr_ways - (n_clusters - level - 1) + 1):
+				new_partial_solution = list(partial_solution)
+				new_partial_solution.append(nr_ways_assigned)
+				remaining_ways = nr_ways - nr_ways_assigned
+
+				this_lower_bound = cost_function(benchmark_set, new_partial_solution, max_bandwidth, remaining_ways)
+
+				total_nodes_expanded += 1
+				depth = len(new_partial_solution)
+				## Prune
+				if bound and op(best_cost, this_lower_bound):
+					continue
+				else:
+					bb_insert_node_hyb(pq, lbs, d_pq, d_lb, d_depths, new_partial_solution, this_lower_bound)
+
+		if leaf_node:
+			# Disable the depth_first (next node will be picked with BF)
+			depth_first = False
+			if op(this_cost, best_cost):
+				# We have reached a leaf node that improves the upper-bound
+				best_cost = this_cost
+				best_solution = partial_solution
+				purge_unpromising(pq, lbs, d_pq, d_lb, d_depths, best_cost, op)
 
 	return (best_cost, best_solution, total_nodes_expanded)
 
@@ -2210,11 +2358,10 @@ def bb_break_into_subnodes(node,nr_clusters, total_nr_ways, max_children):
 	else:
 		level=len(node)
 		nr_remaining_ways=total_nr_ways-sum(node)
-		#high_limit=nr_remaining_ways- (nr_clusters - level - 1) + 1
 		num_children=nr_remaining_ways- (nr_clusters - level - 1) 
 
 		if max_children<=0 or num_children<=max_children:
-		##Subnode is the full nodes
+		##Subnode is the full node
 			return [(node,1,num_children+1)]
 		else:
 			subnodes=[]
@@ -2756,6 +2903,7 @@ def get_optimal_schedule_bf(benchmark_set, cost_function, maximize, nr_ways, max
 	kwargs.setdefault("multiprocessing",False)
 	kwargs.setdefault("user_options",None)
 	kwargs.setdefault("bw_model","simple")
+	kwargs.setdefault("hybrid",False)
 
 	if "user_options" in kwargs:
 		## Merge dict with user options... [Overriding defaults...]
@@ -2796,6 +2944,10 @@ def get_optimal_schedule_bf(benchmark_set, cost_function, maximize, nr_ways, max
 	## Sequential version
 	if kwargs["multiprocessing"]:
 		(best_cost, best_solution, total_branches, metadatum) = get_optimal_schedule_bf_par(benchmark_set, cost_function, max_bandwidth, default_cost, op, nr_ways, user_options=kwargs)
+	elif kwargs["hybrid"]:
+		(best_cost, best_solution, total_branches) = get_optimal_schedule_bf_seq_hybrid(benchmark_set, cost_function,
+																				 max_bandwidth, default_cost, op,
+																				 nr_ways, [], [], bound)
 	else:
 		(best_cost, best_solution, total_branches) = get_optimal_schedule_bf_seq(benchmark_set, cost_function, max_bandwidth, default_cost, op, nr_ways, [], [], bound)
 
@@ -3517,7 +3669,7 @@ def get_scaled_properties_cluster(cluster, max_ways, metric="llcmpkc"):
 	comb_mrc,buckets = whirlpool_combine_ncurves_f(curves,max_ways)
 	hacked_apps=[]
 	for i,app in enumerate(cluster):
-	## Potential optimization in reducing the number of metrics
+		## Potential optimization in reducing the number of metrics
 		props=app.build_scaled_properties([b_ways[i] for b_ways in buckets], []) #["ipc","llcmpki","llcmpkc","slowdown"])
 		hacked_apps.append(App(app.name,props,app))
 
