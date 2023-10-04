@@ -18,9 +18,13 @@
 #
 # You should have received a copy of the GNU General Public License
 # along with this program.  If not, see <http://www.gnu.org/licenses/>.
+from __future__ import print_function
 from simulator_core import *
 from opt_clustering import *
+## Must be commented out in public version
+from simulator_exploration import *
 import numpy as np
+import pandas as pd
 
 ## Efficient function to determine all metrics from slowdown vector...
 ## Returns a dictionary with the collected metrics....
@@ -29,19 +33,56 @@ def compute_basic_metrics(sol_data,max_bandwidth=float('Inf')):
 	(sol_spec,statistics)=sol_data
 	(workload,per_app_ways,per_app_masks,cluster_id)=sol_spec
 	slowdown_vector=get_slowdown_vector(workload,per_app_ways,max_bandwidth)
+	slowdown_vector_np=np.array(slowdown_vector, dtype='float')
 	slowdown_vector_nobw=get_slowdown_vector(workload,per_app_ways)
-
+	nr_apps=len(slowdown_vector)
+	predicted_ipc_vector=[]
+	ipc_alone_vector=[]
+ 
 	metrics["unfairness"] = max(slowdown_vector) / min(slowdown_vector)
-	metrics["antt"] =sum(slowdown_vector) / len(slowdown_vector)
-	stp=0
-	for slowdown in slowdown_vector:
-		stp += 1/slowdown
+	metrics["antt"] =sum(slowdown_vector) / nr_apps
 
-	metrics["stp"] = stp 
+	stp=0.0
+	gmean_ipc=1.0
+	gmean_speedup=1.0
+	m1 = 0
+	hmean_speedup = 0
+	aggregate_ipc=0
+
+	for i,slowdown in enumerate(slowdown_vector):
+		predicted_ipc=workload[i].get_ipc_alone()/slowdown    
+		stp += 1.0/slowdown
+		gmean_ipc *= predicted_ipc
+		gmean_speedup *= 1.0/slowdown
+
+		aggregate_ipc += predicted_ipc;
+		predicted_ipc_vector.append(predicted_ipc)
+		ipc_alone_vector.append(workload[i].get_ipc_alone())
+		hmean_speedup += slowdown ## slowdown is the inverse of speedup
+
+		for j, slowdown2 in enumerate(slowdown_vector):
+			if (j!=i):
+				m1 += abs(slowdown2 - slowdown)
+
+	gmean_ipc=round(gmean_ipc**(1.0/nr_apps),3)
+	gmean_speedup=round(gmean_speedup**(1.0/nr_apps),3)
+ 
+	metrics["stp"] = round(stp,3) 
 	metrics["slowdown"]= slowdown_vector
 	metrics["slowdown_no_bw"]= slowdown_vector_nobw
-
+	metrics["gmean_speedup"] = gmean_speedup
+	metrics["gmean_ipc"]= gmean_ipc
+	cov=np.std(slowdown_vector)/np.mean(slowdown_vector)
+	metrics["unfairness-cov"]=cov
+	metrics["jain-fairness"]=1.0/(1.0+cov**2)
+	metrics["predicted_ipc"]=predicted_ipc_vector
+	metrics["ipc_alone"]=ipc_alone_vector
+	metrics["m1_metric"] = round(m1, 3)
+	metrics["hmean_speedup"] = len(slowdown_vector)/hmean_speedup
+	metrics["aggregate_ipc"] = aggregate_ipc
+ 
 	return metrics
+
 
 
 def mirror_mask(mask,nr_ways):
@@ -97,10 +138,10 @@ def fix_intel_bug_aux(ways,masks,cluster_ids):
 	else:
 		## Nothing to do
 		return masks
-
-
+		
 
 def fix_intel_bug(per_app_ways,per_app_masks,cluster_id):
+	per_app_ways = list(map(int, per_app_ways))
 	## Calculate way count 
 	ways={}
 
@@ -128,11 +169,11 @@ def fix_intel_bug(per_app_ways,per_app_masks,cluster_id):
 
 # Function to pretty-print a workload
 def print_workload(workload,id):
-	print "****WORKLOAD #%d****" % id
+	print("****WORKLOAD #%d****" % id)
 	bnames=[]
 	for benchmark in workload:
 		bnames.append(benchmark.name)
-	print bnames
+	print(bnames)
 
 def sim_print_sol_simple(sched_title,idx,sol_data,max_bandwidth=float('Inf'),print_header=False):
 	metrics=compute_basic_metrics(sol_data,max_bandwidth)
@@ -146,19 +187,34 @@ def sim_print_sol_simple(sched_title,idx,sol_data,max_bandwidth=float('Inf'),pri
 	if print_header:
 		print_workload(workload,idx)
 
-	print "==== Solution for %s ===" % sched_title
+	print("==== Solution for %s ===" % sched_title)
 	i=0
 	for benchmark in workload:
-		print "%s --> (%d ways,%f,%f)" % (benchmark.name,per_app_ways[i],sbw[i],snbw[i])
+		print("%s --> (%d ways,%f,%f)" % (benchmark.name,per_app_ways[i],sbw[i],snbw[i]))
 		i=i+1
-	print "--------------"
-	print "--------------"
-	print "STP=%f" % metrics["stp"]
-	print "Unf=%f" % metrics["unfairness"]
-	print "--------------"
-	print "======================="
+	print("--------------")
+	print("--------------")
+	print("STP=%f" % metrics["stp"])
+	print("Unf=%f" % metrics["unfairness"])
+	print("--------------")
+	print("=======================")
 
-def sim_print_sol_table(sched_title,idx,sol_data,max_bandwidth=float('Inf'),print_header=False):
+def sim_print_sol_table(sched_title,idx,sol_data,max_bandwidth=float('Inf'),print_header=False,**kwargs):
+
+	kwargs.setdefault("user_options",None)
+	kwargs.setdefault("workload_prefix","W")
+	kwargs.setdefault("alg_suffix","")
+	kwargs.setdefault("use_csv",False)
+	kwargs.setdefault("mapping_output",False)
+
+	if "user_options" in kwargs:
+		## Merge dict with user options... [Overriding defaults...]
+		kwargs.update(kwargs["user_options"])
+
+	workload_prefix=kwargs["workload_prefix"]
+	alg_suffix=kwargs["alg_suffix"]
+	use_csv=kwargs["use_csv"]
+	mapping_output=kwargs["mapping_output"]
 
 	metrics=compute_basic_metrics(sol_data,max_bandwidth)
 	(sol_spec,statistics)=sol_data
@@ -170,27 +226,129 @@ def sim_print_sol_table(sched_title,idx,sol_data,max_bandwidth=float('Inf'),prin
 	sbw=metrics["slowdown"]
 	snbw=metrics["slowdown_no_bw"]
 
-	formatted_string="%-4s %-19s %-7s %-20s %-13s %-15s %-17s %-17s %-17s"
-	if print_header:
-		print formatted_string % ("W#","Algorithm","BenchID","Name","Cluster","Mask/NR_WAYS","SlowdownNB/ANTT","STP","Slowdown")
+	if use_csv:
+		if mapping_output:
+			formatted_string="%s,%s,%s,%s,%s,%s,%s,%s,%s,%s"
+		else:
+			formatted_string="%s,%s,%s,%s,%s,%s,%s,%s,%s"
+	else:
+		if mapping_output:
+			formatted_string="%-Xs %-Ys %-9s %-17s %-17s %-13s %-15s %-17s %-17s %-17s"
+		else:
+			formatted_string="%-Xs %-Ys %-9s %-17s %-13s %-15s %-17s %-17s %-17s"
+		formatted_string=formatted_string.replace("X",str(len(workload_prefix)+3)).replace("Y",str(len(alg_suffix)+19))
 
-	for i,benchmark in enumerate(workload):
-		print formatted_string % ("W%i" % idx,sched_title,i+1,benchmark.name,cluster_id[i],per_app_masks[i]+"("+str(per_app_ways[i])+")",round(snbw[i],5),round(1.0/sbw[i],5),round(sbw[i],5))
+	workload_name="%s%i" % (workload_prefix,idx)
+	alg_name="%s%s" % (sched_title,alg_suffix)
+
+	if print_header:
+		if  mapping_output:
+			print(formatted_string % ("W#","Algorithm","BenchID","Name","Cluster","LLCID","Mask/NR_WAYS","SlowdownNB/ANTT","STP","Slowdown"))
+		else:
+			print(formatted_string % ("W#","Algorithm","BenchID","Name","Cluster","Mask/NR_WAYS","SlowdownNB/ANTT","STP","Slowdown"))
+
+	for i,benchmark in enumerate(workload):	
+		if  mapping_output:
+			print(formatted_string % (workload_name,alg_name,i+1,benchmark.name,cluster_id[i], benchmark.llc_id, per_app_masks[i]+"("+str(per_app_ways[i])+")",round(snbw[i],5),round(1.0/sbw[i],5),round(sbw[i],5)))
+		else:
+			print(formatted_string % (workload_name,alg_name,i+1,benchmark.name,cluster_id[i],per_app_masks[i]+"("+str(round(per_app_ways[i]))+")",round(snbw[i],5),round(1.0/sbw[i],5),round(sbw[i],5)))
 
 	time_string= "%.6fs" % statistics["sim_time"]
-	print formatted_string % ("W%i" % idx,sched_title,len(workload)+1,"OVERALL","#"+str(statistics["total_branches"]),time_string,round(metrics["antt"],5),round(metrics["stp"],5),round(metrics["unfairness"],5))
+	if  mapping_output:
+		print(formatted_string % (workload_name,alg_name,len(workload)+1,"OVERALL","#"+str(statistics["total_branches"]),-1,time_string,round(metrics["antt"],5),round(metrics["stp"],5),round(metrics["unfairness"],5)))
+		print(formatted_string % (workload_name,alg_name,-1,len(workload)+1,"OVERALL","-","-",round(metrics["gmean_speedup"],5),round(metrics["gmean_ipc"],5),round(metrics["unfairness-cov"],5)))
+
+	else:
+		print(formatted_string % (workload_name,alg_name,len(workload)+1,"OVERALL","#"+str(statistics["total_branches"]),time_string,round(metrics["antt"],5),round(metrics["stp"],5),round(metrics["unfairness"],5)))
+		print(formatted_string % (workload_name,alg_name,len(workload)+1,"OVERALL","-","-",round(metrics["gmean_speedup"],5),round(metrics["gmean_ipc"],5),round(metrics["unfairness-cov"],5)))
+
 
 	if "times" in statistics:
 		times=statistics["times"]
 		for i,t in enumerate(times):
-			print >> sys.stderr, "W%i,%s,%d,%d,%.6f" % (idx,sched_title,len(workload),i,t)
+			print("W%i,%s,%d,%d,%.6f" % (idx,sched_title,len(workload),i,t), file=sys.stderr)
+
+
+def sim_print_sol_dataframe(sched_title,idx,sol_data,max_bandwidth=float('Inf'),print_header=False,**kwargs):
+
+	kwargs.setdefault("user_options",None)
+	kwargs.setdefault("workload_prefix","W")
+	kwargs.setdefault("alg_suffix","")
+	kwargs.setdefault("use_csv",False)
+
+	if "user_options" in kwargs:
+		## Merge dict with user options... [Overriding defaults...]
+		kwargs.update(kwargs["user_options"])
+
+	workload_prefix=kwargs["workload_prefix"]
+	alg_suffix=kwargs["alg_suffix"]
+	use_csv=kwargs["use_csv"]
+
+	metrics=compute_basic_metrics(sol_data,max_bandwidth)
+	(sol_spec,statistics)=sol_data
+	(workload,per_app_ways,per_app_masks,cluster_id)=sol_spec
+	fix_intel_bug(per_app_ways,per_app_masks,cluster_id)
+
+
+	## Determine slowdown with and widthout BW
+	sbw=metrics["slowdown"]
+	snbw=metrics["slowdown_no_bw"]
+	pred_ipcv=metrics["predicted_ipc"]
+	alone_ipcv=metrics["ipc_alone"] 
+
+# ("W#","Algorithm","BenchID","Name","Cluster","Mask/NR_WAYS","SlowdownNB/ANTT","STP","Slowdown")
+
+	if use_csv:
+		formatted_string="%s,%s,%s,%s,%s,%s"
+	else:
+		formatted_string="%-Xs %-Ys %-9s %-17s %-17s %-17s"
+		formatted_string=formatted_string.replace("X",str(len(workload_prefix)+len("workload")+3)).replace("Y",str(len(alg_suffix)+19))
+
+	workload_name="%s%i" % (workload_prefix,idx)
+	alg_name="%s%s" % (sched_title,alg_suffix)
+
+	if print_header:
+		print(formatted_string % ("workload","scheme","id","app","property","value"))
+
+	for i,benchmark in enumerate(workload):	
+		print(formatted_string % (workload_name,alg_name,i+1,benchmark.name,"cluster_id",cluster_id[i]))
+		print(formatted_string % (workload_name,alg_name,i+1,benchmark.name,"llc_id",benchmark.llc_id))
+		print(formatted_string % (workload_name,alg_name,i+1,benchmark.name,"way_count",per_app_ways[i]))
+		print(formatted_string % (workload_name,alg_name,i+1,benchmark.name,"way_mask",per_app_masks[i]))
+		print(formatted_string % (workload_name,alg_name,i+1,benchmark.name,"slowdown",round(sbw[i],5)))
+		print(formatted_string % (workload_name,alg_name,i+1,benchmark.name,"slowdown_nb",round(snbw[i],5)))
+		print(formatted_string % (workload_name,alg_name,i+1,benchmark.name,"ipc",round(pred_ipcv[i],5)))
+		print(formatted_string % (workload_name,alg_name,i+1,benchmark.name,"ipc_alone",round(alone_ipcv[i],5)))  
+
+	## Overall workload output
+	time_string= "%.6f" % statistics["sim_time"]
+
+	print(formatted_string % (workload_name,alg_name,0,"OVERALL","STP",round(metrics["stp"],5)))
+	print(formatted_string % (workload_name,alg_name,0,"OVERALL","ANTT",round(metrics["antt"],5)))
+	print(formatted_string % (workload_name,alg_name,0,"OVERALL","Unfairness",round(metrics["unfairness"],5)))
+	print(formatted_string % (workload_name,alg_name,0,"OVERALL","UnfairnessCoV",round(metrics["unfairness-cov"],5)))
+	print(formatted_string % (workload_name,alg_name,0,"OVERALL","JainFairness",round(metrics["jain-fairness"],5)))
+	print(formatted_string % (workload_name,alg_name,0,"OVERALL","GmeanSpeedup",round(metrics["gmean_speedup"],5)))
+	print(formatted_string % (workload_name,alg_name,0,"OVERALL","GmeanIPC",round(metrics["gmean_ipc"],5)))
+	print(formatted_string % (workload_name,alg_name,0,"OVERALL","AggregateIPC",round(metrics["aggregate_ipc"],5)))
+	print(formatted_string % (workload_name,alg_name,0,"OVERALL","HmeanSpeedup",round(metrics["hmean_speedup"],5)))
+	print(formatted_string % (workload_name,alg_name,0,"OVERALL","M1",round(metrics["m1_metric"],5)))
+	print(formatted_string % (workload_name,alg_name,0,"OVERALL","sim_time_s",time_string))
+	print(formatted_string % (workload_name,alg_name,0,"OVERALL","explored_sols",str(statistics["total_branches"])))
+
+	if "times" in statistics:
+		times=statistics["times"]
+		for i,t in enumerate(times):
+			print(formatted_string % (workload_name,alg_name,0,"OVERALL","sim_time%d" % (i,t)))
+
+
 
 def sim_print_sol_masks(sched_title,idx,sol_data,max_bandwidth=float('Inf'),print_header=False):
 	(sol_spec,statistics)=sol_data
 	(workload,per_app_ways,per_app_masks,cluster_id)=sol_spec
 	fix_intel_bug(per_app_ways,per_app_masks,cluster_id)
 	for mask in per_app_masks:
-		print mask,
+		print(mask,)
 	print
 
 def sim_print_sol_masks_debussy(sched_title,idx,sol_data,max_bandwidth=float('Inf'),print_header=False):
@@ -250,7 +408,7 @@ def sim_print_sol_masks_debussy(sched_title,idx,sol_data,max_bandwidth=float('In
 
 
 	for mask in per_app_masks:
-		print mask,
+		print(mask,)
 	print
 
 
@@ -267,15 +425,24 @@ def sim_print_cluster_info(sched_title,idx,sol_data,max_bandwidth=float('Inf'),p
 	#print workload_data
 	ways={}
 	masks={}
+	llc_id={}
+	cluster_llc=[]
 
 	cluster_zero=False
-	for idx in range(len(workload)):
+	llc_id_matters=False
+
+	for idx,benchmark in enumerate(workload):	
 		cid=cluster_id[idx]
 		ways[cid]=per_app_ways[idx]
 		masks[cid]=per_app_masks[idx]
+		llc_id[cid]=benchmark.llc_id	
+		cluster_llc.append(benchmark.llc_id)
 
 		if cid==0:
 			cluster_zero=True
+
+		if not llc_id_matters and benchmark.llc_id!=-1:
+			llc_id_matters=True
 
 
 	if print_masks:
@@ -291,19 +458,29 @@ def sim_print_cluster_info(sched_title,idx,sol_data,max_bandwidth=float('Inf'),p
 		sorted_cluster_ids=sorted(target.keys())
 		cluster_spec=','.join([str(target[i]) for i in sorted_cluster_ids])
 		cluster_map=[sorted_cluster_ids.index(i) for i in cluster_id]
-		print "%s;%s" % (','.join(map(str, cluster_map)),cluster_spec) 
+		print("%s;%s" % (','.join(map(str, cluster_map)),cluster_spec))
 	else:
-		## Print out things
-		if cluster_zero:
-			cluster_spec=','.join([str(target[i]) for i in range(0,len(target))])
+		start=0 if cluster_zero else 1
+
+		if not llc_id_matters:
+			## Print out things
+			cluster_spec=','.join([str(target[i]) for i in range(start,len(target))])
+			print("%s;%s" % (','.join(map(str, cluster_id)),cluster_spec))
 		else:
-			cluster_spec=','.join([str(target[i]) for i in range(1,len(target)+1)])
-	
-		print "%s;%s" % (','.join(map(str, cluster_id)),cluster_spec) 
+			## Combine pairs idx_cluster-app/llc_group;
+			cluster_spec=[ "%s/%d" % (target[i],llc_id[i])  for i in range (start,len(target)) ]		
+			cluster_spec_str=','.join(cluster_spec)
+			id_clusters=','.join(map(str, cluster_id))
+			id_groups=','.join(map(str, cluster_llc))
+			print("%s;%s;%s" % (id_clusters,id_groups,cluster_spec_str))			
 
 
-def initialize_simulator(bw_model):
-	select_bw_model(bw_model)
+
+def initialize_simulator(args):
+	select_bw_model(args.bw_model)
+	select_topology(args.topology)
+	## Must be commented out in public version
+	add_experimental_algorithms()
 
 ## Parameters
 # ------------
@@ -316,7 +493,7 @@ def initialize_simulator(bw_model):
 # Tuple with two mandatory items
 # 1st item [solution]: (nr_ways_per_app, cat_masks, cluster_id_app)
 # 2nd item [statistics dict]: (time to reach solution, total branches explored)
-def apply_part_algorithm(algorithm,workload,nr_ways,max_bandwidth,parallel=False,debugging=False,uoptions={},workload_name="W"):
+def apply_part_algorithm(algorithm,workload,nr_ways,max_bandwidth=float('Inf'),parallel=False,debugging=False,uoptions={},workload_name="W",opt_spec=(unfairness,"False")):
 	solution=None
 	total_branches=1
 	stats={}
@@ -348,6 +525,8 @@ def apply_part_algorithm(algorithm,workload,nr_ways,max_bandwidth,parallel=False
 			(cost,solution,total_branches,metadata)=get_optimal_schedule_bf(workload,throughput,True,nr_ways,max_bandwidth,multiprocessing=parallel,user_options=uoptions)
 		elif algorithm=="opt-unf-bf":
 			(cost,solution,total_branches,metadata)=get_optimal_schedule_bf(workload,unfairness_max_throughput,False,nr_ways,max_bandwidth,multiprocessing=parallel,user_options=uoptions)
+		elif algorithm=="opt-bf":
+			(cost,solution,total_branches,metadata)=get_optimal_schedule_bf(workload,opt_spec[0],opt_spec[1],nr_ways,max_bandwidth,multiprocessing=parallel,user_options=uoptions)
 		elif algorithm=="optc-stp":
 			(patched_workload,per_app_ways,per_app_masks,cluster_id,total_branches,metadata)=get_optimal_clustering(workload,throughput,True,nr_ways,max_bandwidth,multiprocessing,user_options=uoptions)
 		elif algorithm=="optc-unf":
@@ -356,6 +535,32 @@ def apply_part_algorithm(algorithm,workload,nr_ways,max_bandwidth,parallel=False
 			(patched_workload,per_app_ways,per_app_masks,cluster_id,total_branches,metadata)=get_optimal_clustering_bf(workload,throughput,True,nr_ways,max_bandwidth,multiprocessing,user_options=uoptions)
 		elif algorithm=="optc-unf-bf":
 			(patched_workload,per_app_ways,per_app_masks,cluster_id,total_branches,metadata)=get_optimal_clustering_bf(workload,unfairness_max_throughput,False,nr_ways,max_bandwidth,multiprocessing=parallel,user_options=uoptions)
+		elif algorithm=="optc":
+			(patched_workload,per_app_ways,per_app_masks,cluster_id,total_branches,metadata)=get_optimal_clustering_bf(workload,opt_spec[0],opt_spec[1],nr_ways,max_bandwidth,multiprocessing=parallel,user_options=uoptions)
+		elif algorithm=="opt-map-stp":
+			uopt_patched=dict(uoptions)
+			uopt_patched["opt_mapping"]=True
+			(patched_workload,per_app_ways,per_app_masks,cluster_id,total_branches,metadata)=get_optimal_clustering_bf(workload,throughput,True,nr_ways,max_bandwidth,multiprocessing,user_options=uopt_patched)
+		elif algorithm=="opt-map-unf":
+			uopt_patched=dict(uoptions)
+			uopt_patched["opt_mapping"]=True
+			(patched_workload,per_app_ways,per_app_masks,cluster_id,total_branches,metadata)=get_optimal_clustering_bf(workload,unfairness_max_throughput,False,nr_ways,max_bandwidth,multiprocessing=parallel,user_options=uopt_patched)
+		elif algorithm=="opt-map-cov":
+			uopt_patched=dict(uoptions)
+			uopt_patched["opt_mapping"]=True
+			(patched_workload,per_app_ways,per_app_masks,cluster_id,total_branches,metadata)=get_optimal_clustering_bf(workload,cov_unfairness_metric,False,nr_ways,max_bandwidth,multiprocessing=parallel,user_options=uopt_patched)
+		elif algorithm=="opt-map-fair":
+			uopt_patched=dict(uoptions)
+			uopt_patched["opt_mapping"]=True
+			(patched_workload,per_app_ways,per_app_masks,cluster_id,total_branches,metadata)=get_optimal_clustering_bf(workload,fairness_metric,True,nr_ways,max_bandwidth,multiprocessing=parallel,user_options=uopt_patched)
+		elif algorithm=="opt-map-antt":
+			uopt_patched=dict(uoptions)
+			uopt_patched["opt_mapping"]=True
+			(patched_workload,per_app_ways,per_app_masks,cluster_id,total_branches,metadata)=get_optimal_clustering_bf(workload,antt_metric,False,nr_ways,max_bandwidth,multiprocessing=parallel,user_options=uopt_patched)			
+		elif algorithm=="opt-map":
+			uopt_patched=dict(uoptions)
+			uopt_patched["opt_mapping"]=True
+			(patched_workload,per_app_ways,per_app_masks,cluster_id,total_branches,metadata)=get_optimal_clustering_bf(workload,opt_spec[0],opt_spec[1],nr_ways,max_bandwidth,multiprocessing=parallel,user_options=uopt_patched)	
 		elif algorithm=="yu-petrov":
 			solution=get_schedule_yu_petrov(workload,nr_ways)
 		elif algorithm=="ucp":
@@ -378,8 +583,10 @@ def apply_part_algorithm(algorithm,workload,nr_ways,max_bandwidth,parallel=False
 		elif algorithm=="equal-part":
 			solution=get_equal_llc_schedule(len(workload),nr_ways)
 		else:
-			print "algorithm not valid: %s" % algorithm
-			exit(1)		
+			## Must be commented out in public version
+			(patched_workload,per_app_ways,per_app_masks,cluster_id)=invoke_extra_algorithm(algorithm,workload,nr_ways,max_bandwidth,parallel,debugging,uoptions,opt_spec)
+			#print "algorithm not valid: %s" % algorithm
+			#exit(1)		
 
 		if time_model:
 			unfairness_max_throughput(workload, solution, max_bandwidth)
@@ -441,13 +648,17 @@ def execute_simulation(simulation):
 	nr_ways=params["nr_ways"]
 	max_bandwidth=params["max_bandwidth"]
 
-	return apply_part_algorithm(algorithms[idx_algorithm],workloads[idx_workload],nr_ways,max_bandwidth,parallel=False,debugging=False,uoptions=uoptions,workload_name=wname)
+	alg=algorithms[idx_algorithm]
+	algorithm=alg[0]
+	opt_spec=alg[1]
+
+	return apply_part_algorithm(algorithm,workloads[idx_workload],nr_ways,max_bandwidth,parallel=False,debugging=False,uoptions=uoptions,workload_name=wname,opt_spec=opt_spec)
 
 
 
 def launch_simulations_in_parallel(workloads,algorithms,workload_range,nr_ways,max_bandwidth, uoptions,bw_model):
 	parallel=False ## Forced
-	debugging=False
+	debugging=False #True
 
 	# Establish connection
 	rc = ipp.Client(timeout=30000) 
@@ -477,7 +688,7 @@ def launch_simulations_in_parallel(workloads,algorithms,workload_range,nr_ways,m
 	lview = rc.load_balanced_view(block=True)
 
 	if debugging:
-		results=map(lambda simdata: execute_simulation(simdata), simulations)
+		results=[r for r in map(lambda simdata: execute_simulation(simdata), simulations)]
 	else:
 		results=lview.map(lambda simdata: execute_simulation(simdata), simulations)
 

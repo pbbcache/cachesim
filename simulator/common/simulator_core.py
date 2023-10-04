@@ -19,6 +19,7 @@
 #
 # You should have received a copy of the GNU General Public License
 # along with this program.  If not, see <http://www.gnu.org/licenses/>.
+from __future__ import print_function
 import operator
 import csv
 import sys
@@ -29,7 +30,7 @@ import multiprocessing
 from multiprocessing.pool import ThreadPool
 import ipyparallel as ipp
 from subprocess import call
-from sklearn.cluster import KMeans
+#from sklearn.cluster import KMeans
 import time
 import functools
 import datetime
@@ -42,6 +43,7 @@ import socket
 import uuid
 from ipyparallel.util import disambiguate_url
 import ctypes 
+from functools import reduce
 
 # Function to parse a harness file
 def parse_harness_file(filename):
@@ -61,7 +63,7 @@ def parse_harness_file(filename):
 	
 
 
-glb_algorithms_supported=["opt-stp","yu-petrov","opt-unf","ucp","ucp-slowdown","kpart","whirlpool","whirlpool-c","equal-part","optc-stp","optc-unf","opt-unf-np","opt-stp-np","yu-petrov","user","kpart-opt","opt-stp-bf","opt-unf-bf","optc-stp-bf","optc-unf-bf"]
+glb_algorithms_supported=["opt-stp","yu-petrov","opt-unf","ucp","ucp-slowdown","kpart","whirlpool","whirlpool-c","equal-part","optc-stp","optc-unf","opt-unf-np","opt-stp-np","yu-petrov","user","kpart-opt","opt-stp-bf","opt-unf-bf","opt-bf","optc-stp-bf","optc-unf-bf","optc","opt-map-stp","opt-map-unf","opt-map-antt","opt-map-fair","opt-map-cov","opt-map"]
 
 # Function to add extra algorithms to supported global list
 def add_extra_algorithms(*algs):
@@ -120,6 +122,7 @@ def get_total_bandwidth(target_slowdown,bw_shared,cur_total_bw):
 # 	....
 def estimate_bw_shared(bw_alone_vector):
 	n=len(bw_alone_vector)
+	#bw_alone_vector=list(bw_alone_vector)
 	equations=[]
 	U=sp.Symbol('U')
 	variables=[U]
@@ -127,6 +130,7 @@ def estimate_bw_shared(bw_alone_vector):
 	## To build equations dynamically
 	eq=-U
 
+	#old loop
 	for i in range(n):
 		bi=bw_alone_vector[i]
 		ui=sp.Symbol('u%d' % i)
@@ -136,6 +140,7 @@ def estimate_bw_shared(bw_alone_vector):
 		eq+=ui
 		guess.append(bi)
 
+
 	equations.append(eq)#"-U+u0+u1+u2")#)eq)
 
 	try:
@@ -143,34 +148,22 @@ def estimate_bw_shared(bw_alone_vector):
 	except:
 		return guess
 
+## Topology is another global simulator parameter
+glb_active_topology=0
+glb_available_topologies=["uma","numa"]
 
-# Function that applies the variation of Morad's probabilistic bandwidth model and returns the estimated overall slowdown
-def apply_bw_model(bw_alone_vector,slowdown_vector,max_bandwidth):
-	bw_alone_vnorm=map(lambda x: x/max_bandwidth,bw_alone_vector)
-
-	## Invoke solver to determine approximate solution
-	solver_solution=estimate_bw_shared(bw_alone_vnorm)
-	
-	## Get max predicted BW from solution
-	predicted_total_bw=solver_solution[0]
-
-	# Get BW shared for each app
-	predicted_bw_shared=solver_solution[1:]
-
-	overall_slowdown=[]
-	
-	## Determine actual slowdown by considering BW-related slowdown 
-	for i,bw_alone in enumerate(bw_alone_vnorm): 
-		## Simple model (Slowdown is proportional to BW reduction)
-		bw_slowdown_factor=bw_alone/predicted_bw_shared[i]
-		## Calculate performance reduction 
-		overall_slowdown.append(slowdown_vector[i]*bw_slowdown_factor)
-
-	return overall_slowdown
+# Function to select which topology to use
+def select_topology(str_topo):
+	global glb_active_topology
+	if str_topo in glb_available_topologies:
+		glb_active_topology=glb_available_topologies.index(str_topo)
+	else:
+		print("No such topology: ", str_topo, file=sys.stderr)
+		exit(1)
 
 ## Global simulator parameter
-glb_active_bw_model=0
-glb_available_bw_models=["simple","stalls"]
+glb_active_bw_model=2
+glb_available_bw_models=["morad","stalls","simple"]
 
 # Function to select which bandwidth model to use (traditional, improved, etc.)
 def select_bw_model(str_model):
@@ -178,11 +171,12 @@ def select_bw_model(str_model):
 	if str_model in glb_available_bw_models:
 		glb_active_bw_model=glb_available_bw_models.index(str_model)
 	else:
-		print >> sys.stderr, "No such BW model: ", str_model
+		print("No such BW model: ", str_model, file=sys.stderr)
 		exit(1)
 
 # Function that applies the bandwidth model for a specific application list, the assigned ways and the maximum observed bandwidth
 def apply_bw_model_gen(benchmark_list,ways_assigned,max_bandwidth):
+	ways_assigned = list(map(int, ways_assigned))
 	slowdown_vector = []
 	bw_alone_vector = []
 
@@ -211,35 +205,50 @@ def apply_bw_model_gen(benchmark_list,ways_assigned,max_bandwidth):
 				mem_stalls=s_total ## Truncate
 			mem_access_stalls_alone_v.append(mem_stalls)
 
-	bw_alone_vnorm=map(lambda x: x/max_bandwidth,bw_alone_vector)
 
-	## Invoke solver to determine approximate solution
-	solver_solution=estimate_bw_shared(bw_alone_vnorm)
+	if glb_active_bw_model<=1:
+		bw_alone_vnorm=list(map(lambda x: x/max_bandwidth,bw_alone_vector))
+
+		## Invoke solver to determine approximate solution
+		solver_solution=estimate_bw_shared(bw_alone_vnorm)
 	
-	## Get max predicted BW from solution
-	predicted_total_bw=solver_solution[0]
+		## Get max predicted BW from solution
+		predicted_total_bw=solver_solution[0]
 
-	# Get BW shared for each app
-	predicted_bw_shared=solver_solution[1:]
+		# Get BW shared for each app
+		predicted_bw_shared=solver_solution[1:]
+	else:
+		aggregate_alone_bw=sum(bw_alone_vector)
+		if aggregate_alone_bw<=max_bandwidth:
+			## No saturation, no problem 
+			predicted_bw_shared=bw_alone_vector
+		else:
+			## KPART SIMPLE MODEL...
+			max_b_alone=max(bw_alone_vector)
+			sum_square=(1.0/max_b_alone)*functools.reduce(operator.add,map(lambda bw: bw**2,bw_alone_vector))
+			xm=(max_bandwidth+sum_square-aggregate_alone_bw)/sum_square
+			predicted_bw_shared=[bi*(1-(bi/max_b_alone)*(1-xm)) for bi in bw_alone_vector]
+
+		## In this case, predicted_bw_shared and bw_alone_vnorm are not really normalized
+		## But maintaining a uniform format is better
+		bw_alone_vnorm=bw_alone_vector
+
 
 	overall_slowdown=[]
 	
 	## Determine actual slowdown by considering BW-related slowdown 
 	for i,bw_alone in enumerate(bw_alone_vnorm): 
-		## Simple model (Slowdown is proportional to BW reduction)
-		bw_slowdown_factor=bw_alone/predicted_bw_shared[i]
-
 		## Alter bw_slowdown_factor according to stall-based model
 		if glb_active_bw_model==1:
 			s_alone=total_stalls_alone_v[i]
 			m_alone=mem_access_stalls_alone_v[i]
 			## bw_slowdown_factor is Old value provided by Morad's model
 			## Determine new bw_slowdown factor
-			old_morad=bw_slowdown_factor
+			old_morad=float(bw_alone/predicted_bw_shared[i])
 			bw_slowdown_factor=(s_alone+m_alone*(old_morad-1))/s_alone
-			#assert(old_morad<bw_slowdown_factor)
-
-			#bw_slowdown_factor=s_shared/s_alone
+		else:
+			## Simple models (Slowdown is proportional to BW reduction)
+			bw_slowdown_factor=bw_alone/predicted_bw_shared[i]			
 
 		## Calculate performance reduction 
 		overall_slowdown.append(slowdown_vector[i]*bw_slowdown_factor)
@@ -248,7 +257,7 @@ def apply_bw_model_gen(benchmark_list,ways_assigned,max_bandwidth):
 
 # Function to estimate the bandwidth shared of each application form an array of bandwidth alone and the maximum observed bandwidth
 def determine_bw_shared(bw_alone_vector,max_bandwidth):
-	bw_alone_vnorm=map(lambda x: x/max_bandwidth,bw_alone_vector)
+	bw_alone_vnorm=list(map(lambda x: x/max_bandwidth,bw_alone_vector))
 
 	## Invoke solver to determine approximate solution
 	solver_solution=estimate_bw_shared(bw_alone_vnorm)
@@ -257,6 +266,51 @@ def determine_bw_shared(bw_alone_vector,max_bandwidth):
 	return (solver_solution[0]*max_bandwidth,map(lambda x: x* max_bandwidth,solver_solution[1:]))		
 
 
+
+def apply_bw_model_topology(benchmark_list,ways_assigned,max_bandwidth):
+	if glb_active_topology==0: ## UMA
+		return apply_bw_model_gen(benchmark_list,ways_assigned,max_bandwidth)
+	elif glb_active_topology==1: ## NUMA
+		## Traverse applications to determine which one goes with
+		## and treat each thing separately
+		llc_id_count=0
+		app_llc_id=[]
+		dict_groups={}
+		for i,app in enumerate(benchmark_list):
+			llc_id=app.llc_id
+			if llc_id==-1:
+				llc_id=0 ## Normalize
+			if llc_id in dict_groups:
+				(list_apps,idx_apps,ways_apps)=dict_groups[llc_id]
+			else:
+				list_apps=[]
+				idx_apps=[]
+				ways_apps=[]
+				dict_groups[llc_id]=(list_apps,idx_apps,ways_apps)
+				## New llc ID detected
+				llc_id_count=llc_id_count+1 
+			## Keep track of normalized LLC_ID
+			app_llc_id.append(llc_id)
+			## Store per LLCID info
+			list_apps.append(app)
+			idx_apps.append(i)
+			ways_apps.append(ways_assigned[i])
+
+		if llc_id_count==1: ## Single group?
+			return apply_bw_model_gen(benchmark_list,ways_assigned,max_bandwidth)
+		else:
+
+			## Populate and combine slowdowns
+			slowdowns=[1 for i in range(len(benchmark_list))]
+
+			for llc_id in range(llc_id_count):
+				(list_apps,idx_apps,ways_apps)=dict_groups[llc_id]
+				## Calculate BW and cache contention assuming local memory allocation
+				sv=apply_bw_model_gen(list_apps,ways_apps,max_bandwidth)
+				for j,idx in enumerate(idx_apps):
+					slowdowns[idx]=sv[j]
+
+			return slowdowns
 
 
 ################################################################################
@@ -269,22 +323,28 @@ class App:
 	def __init__(self, name, properties, parent=None):
 		self.name = name
 		self.properties=properties
+		
 		self.scaling_factor=1.
 		self.bench_id=-1
+		self.cluster_in_llc=-1
+		self.llc_id=-1
 		## For kpart
 		if parent:
 			self.original_app=parent.original_app
 			self.bench_id=parent.bench_id
+			self.llc_id=parent.llc_id
 		else:
 			self.original_app=self		
+		## Added for efficiency reasons
+		self.nr_ways=len(self.original_app.properties["ipc"])
 
 
 	def __repr__(self):
 		return repr((self.name))
 
 	def show(self):
-		print "==== %s ====" % self.name 
-		print self.properties
+		print("==== %s ====" % self.name) 
+		print(self.properties)
 
 	def get_metric_table(self,metric):
 		return self.properties.sort_index()[metric]
@@ -295,6 +355,10 @@ class App:
 		ipc_ref=self.original_app.properties["ipc"][nr_ways_fair]
 		return 	(self.properties["ipc"]*(self.scaling_factor/ipc_ref)).sort_index()
 
+	def get_ipc_alone(self):
+		ipc_table=self.original_app.properties["ipc"]
+		return ipc_table[self.nr_ways]
+     
 	## Scaled ways is a python list of floats
 	## (proportional ways in cluster the application belongs to )
 	# metrics for Kpart: "bandwidth_mbps","ipc","slowdown","llcmpki"
@@ -311,7 +375,7 @@ class App:
 		res_dict = {c:[] for c in bdf.columns}
 		res_dict["float_ways"] = []
 		# Build zero interpolation
-		projected_values = bdf.ix[1]+(bdf.ix[1]-bdf.ix[2])
+		projected_values = bdf.loc[1]+(bdf.loc[1]-bdf.loc[2])
 		projected_values = projected_values.apply(lambda x: 0.000001 if x<=0 else x)
 		float_ways = []
 		for cur_ways in range(len(scaled_ways)):
@@ -338,28 +402,12 @@ class App:
 
 		return float_df
 
-def get_slowdown_vector_old(benchmark_list, solution, max_bandwidth=float('Inf')):
-	throughput_value = 0
-	slowdown_vector = []
-	bw_alone_vector = []
-
-	for i,benchmark in enumerate(benchmark_list):
-		if i < len(solution): # i can be greater than or equal to len(solution) if the solution is partial (for bounding)
-			slowdown_vector.append(benchmark.properties["slowdown"][solution[i]])
-			bw_alone_vector.append(benchmark.properties["bandwidth_mbps"][solution[i]])
-
-	## Apply BW model if necessary
-	if max_bandwidth != float('Inf'):	
-		## Replace slowdown vector ...
-		return apply_bw_model(bw_alone_vector,slowdown_vector,max_bandwidth)
-	else:
-		return slowdown_vector	
-
 def get_slowdown_vector(benchmark_list, solution, max_bandwidth=float('Inf')):
+	solution = list(map(int, solution))
 	## Apply BW model if necessary
 	if max_bandwidth != float('Inf'):	
 		## Replace slowdown vector ...
-		return apply_bw_model_gen(benchmark_list[0:len(solution)],solution,max_bandwidth)
+		return apply_bw_model_topology(benchmark_list[0:len(solution)],solution,max_bandwidth)
 	else:
 		slowdown_vector = []
 		for i,benchmark in enumerate(benchmark_list):
@@ -397,18 +445,19 @@ def normalize_solution(benchmark_set, solution, remaining_ways=0):
 	## Obtain plain version of the solution for evaluation
 	if clustering: ## Plain version of the solution
 		plain_solution=[]
+		order_apps=[]
 		for i,cluster in enumerate(cluster_list):
 			cluster_ways=final_solution[i]
 			for app in cluster:
 				plain_solution.append(cluster_ways)
+				order_apps.append(app)
 
-		## Overwrite variable...
+		## Overwrite variables...
 		final_solution=plain_solution
-
+		apps=order_apps
+		
 	return (apps,final_solution,len(apps)-nr_apps_no_solution)
 		
-
-
 # Throughput function.
 # Params: Benchmarks data, solution dictionary, max bandwidth and remaining ways (to know if it is a partial solution, used for bounding)
 # Return: Throughput value calculated.
@@ -425,7 +474,15 @@ def throughput(benchmark_set, solution, max_bandwidth=float('Inf'), remaining_wa
 	del slowdown_vector
 	del final_solution
 
+	throughput_value=round(throughput_value,3)
+
 	return throughput_value
+
+# Throughput function.
+# Params: Benchmarks data, solution dictionary, max bandwidth and remaining ways (to know if it is a partial solution, used for bounding)
+# Return: Throughput value calculated.
+def stp(benchmark_set, solution, max_bandwidth=float('Inf'), remaining_ways=0):
+	return throughput(benchmark_set, solution, max_bandwidth=max_bandwidth, remaining_ways=remaining_ways)
 
 # Unfairness function.
 # Params: Benchmarks data, solution dictionary, max bandwidth and remaining ways (to know if it is a partial solution, used for bounding)
@@ -444,11 +501,120 @@ def unfairness(benchmark_set, solution, max_bandwidth=float('Inf'), remaining_wa
 		unfairness_value = max(slowdown_vector) / min(slowdown_vector[0:len(solution)])
 	else:
 		unfairness_value = max(slowdown_vector) / min(slowdown_vector)
-		
-	
+
+
 	del slowdown_vector
 	return unfairness_value
 
+# Geometric mean function.
+# Params: Benchmarks data, solution dictionary, max bandwidth and remaining ways (to know if it is a partial solution, used for bounding)
+# Return: Geometric mean value calculated.
+def gmean_speedup(benchmark_set, solution, max_bandwidth=float('Inf'), remaining_ways=0):
+	##Keep track of 
+	(benchmark_list,final_solution,apps_in_partial_solution)=normalize_solution(benchmark_set, solution,remaining_ways)
+	slowdown_vector=get_slowdown_vector(benchmark_list,final_solution,max_bandwidth)
+
+	## Calculate gmean
+	gmean_value=1
+	for slowdown in slowdown_vector:
+		gmean_value *= 1/slowdown
+
+	gmean_value=gmean_value**(1/len(slowdown_vector))
+
+	del slowdown_vector
+	del final_solution
+
+	gmean_value=round(gmean_value,3)
+
+	return gmean_value
+
+
+# Throughput function.
+# Params: Benchmarks data, solution dictionary, max bandwidth and remaining ways (to know if it is a partial solution, used for bounding)
+# Return: Throughput value calculated.
+def gmean_ipc(benchmark_set, solution, max_bandwidth=float('Inf'), remaining_ways=0):
+	##Keep track of 
+	(benchmark_list,final_solution,apps_in_partial_solution)=normalize_solution(benchmark_set, solution,remaining_ways)
+	slowdown_vector=get_slowdown_vector(benchmark_list,final_solution,max_bandwidth)		
+	predicted_ipc=[ app.get_ipc_alone()/slowdown_vector[i] for i,app in enumerate(benchmark_list)]
+
+	## Calculate throughput
+	throughput_value=1.0
+	for ipc in predicted_ipc:
+		throughput_value *= ipc
+
+	throughput_value=round(throughput_value**(1.0/len(predicted_ipc)),3)
+
+	del slowdown_vector
+	del final_solution
+	del predicted_ipc
+
+	return throughput_value
+
+# Harmonic mean function.
+# Params: Benchmarks data, solution dictionary, max bandwidth and remaining ways (to know if it is a partial solution, used for bounding)
+# Return: Harmonic mean value calculated.
+def hmean_speedup(benchmark_set, solution, max_bandwidth=float('Inf'), remaining_ways=0):
+    ##Keep track of 
+    (benchmark_list,final_solution,apps_in_partial_solution)=normalize_solution(benchmark_set, solution,remaining_ways)
+    slowdown_vector=get_slowdown_vector(benchmark_list,final_solution,max_bandwidth)
+
+    hmean_value=len(slowdown_vector)/sum([s for s in slowdown_vector])  ## slowdown is the inverse of speedup
+
+    hmean_value=round(hmean_value,3)
+
+    del slowdown_vector
+    del final_solution
+
+    return hmean_value
+
+
+# Aggregate IPCs function.
+# Params: Benchmarks data, solution dictionary, max bandwidth and remaining ways (to know if it is a partial solution, used for bounding)
+# Return: Aggregate IPC value calculated.
+def aggregate_ipc(benchmark_set, solution, max_bandwidth=float('Inf'), remaining_ways=0):
+	## Keep track of
+	(benchmark_list, final_solution, apps_in_partial_solution) = normalize_solution(benchmark_set, solution, remaining_ways)
+	slowdown_vector = get_slowdown_vector(benchmark_list, final_solution, max_bandwidth)
+	ipc_values=[ app.get_ipc_alone()/slowdown_vector[i] for i,app in enumerate(benchmark_list)]
+
+	## Calculate aggregate IPC
+	agg_ipc_value=sum(ipc_values)
+
+	del final_solution
+	del ipc_values
+
+	return agg_ipc_value
+
+#  M1 fairness metric function.
+#  Params: benchmark data, solution dictionary, max bandwidth and remaining ways (to know if it is a partial solution, used for bounding).
+#  Return: M1 metric calculated.
+def m1_metric(benchmark_set, solution, max_bandwidth=float('Inf'), remaining_ways=0):
+    ## Keep track of
+    (benchmark_list, final_solution, apps_in_partial_solution) = normalize_solution(benchmark_set, solution, remaining_ways)
+    slowdown_vector = get_slowdown_vector(benchmark_list, final_solution, max_bandwidth)
+
+    ## Calculate M1 metric
+    m1_metric = 0
+    ## Calculate correct lower bound... (assuming the rest slowdowns can be made as close as possible)
+    if remaining_ways>0:
+        num_apps = apps_in_partial_solution + 1 ##len(slowdown_vector)
+        seq=slowdown_vector[apps_in_partial_solution:]
+        ## Patch slowdown average
+        slowdown_vector[apps_in_partial_solution]=reduce(lambda x, y: x + y, seq ) / float(len(seq))
+    else:
+        num_apps = len(slowdown_vector)		
+  
+    for i in range(num_apps):
+        for j in range(i+1, num_apps):
+            m1_metric += abs(slowdown_vector[i] - slowdown_vector[j])
+
+    del slowdown_vector
+    del final_solution
+
+    m1_metric = round(m1_metric, 3)
+
+    return m1_metric
 
 # ANTT METRIC function.
 # Params: Benchmarks data, solution dictionary, max bandwidth and remaining ways (to know if it is a partial solution, used for bounding)
@@ -460,6 +626,9 @@ def antt_metric(benchmark_set, solution, max_bandwidth=float('Inf'), remaining_w
 	antt_value = sum(slowdown_vector) / len(slowdown_vector)
 	del slowdown_vector
 	return antt_value
+
+def antt(benchmark_set, solution, max_bandwidth=float('Inf'), remaining_ways=0):
+	return antt_metric(benchmark_set, solution, max_bandwidth, remaining_ways)
 
 # Unfairness function maximizing throughput.
 # Params: Benchmarks data, solution dictionary, max bandwidth and remaining ways (to know if it is a partial solution, used for bounding)
@@ -481,17 +650,59 @@ def unfairness_max_throughput(benchmark_set, solution, max_bandwidth=float('Inf'
 	else:
 		unfairness_value = max(slowdown_vector) / min(slowdown_vector)
 
+	unfairness_value=round(unfairness_value,3)
+	throughput_value=round(throughput_value,3)
 	del slowdown_vector
 	return (unfairness_value,-throughput_value)
 
 
+def unf_stp(benchmark_set, solution, max_bandwidth=float('Inf'), remaining_ways=0):
+	return unfairness_max_throughput(benchmark_set, solution, max_bandwidth, remaining_ways)
+
+
 def fairness_metric(benchmark_set, solution, max_bandwidth=float('Inf'), remaining_ways=0):
 	(benchmark_list,final_solution,apps_in_partial_solution)=normalize_solution(benchmark_set, solution,remaining_ways) 
-	slowdown_vector=get_slowdown_vector(benchmark_list,final_solution,max_bandwidth)		
+	slowdown_vector=get_slowdown_vector(benchmark_list,final_solution,max_bandwidth)
+	slowdown_vector = np.array(slowdown_vector, dtype='float')
 	fairness=1-np.std(slowdown_vector)/np.mean(slowdown_vector)
 	del slowdown_vector
 	return fairness
 
+
+def cov_unfairness_metric(benchmark_set, solution, max_bandwidth=float('Inf'), remaining_ways=0):
+	(benchmark_list,final_solution,apps_in_partial_solution)=normalize_solution(benchmark_set, solution,remaining_ways) 
+	slowdown_vector=get_slowdown_vector(benchmark_list,final_solution,max_bandwidth)
+	slowdown_vector = np.array(slowdown_vector, dtype='float')
+	unfairness=np.std(slowdown_vector)/np.mean(slowdown_vector)
+	del slowdown_vector
+	return unfairness
+
+def jain_fairness(benchmark_set, solution, max_bandwidth=float('Inf'), remaining_ways=0):
+	cov=cov_unfairness_metric(benchmark_set, solution, max_bandwidth, remaining_ways)
+	return 1.0/(1.0+cov**2)
+
+
+# Params: Benchmarks data, solution dictionary, max bandwidth and remaining ways (to know if it is a partial solution, used for bounding)
+# Return: Unfairness and -throughput tuple calculated.
+def max_slowdown_unfairness(benchmark_set, solution, max_bandwidth=float('Inf'), remaining_ways=0):
+	(benchmark_list,final_solution,apps_in_partial_solution)=normalize_solution(benchmark_set, solution,remaining_ways) 
+	throughput_value = 0	
+	
+	slowdown_vector=get_slowdown_vector(benchmark_list,final_solution,max_bandwidth)
+	
+
+	max_slowdown=max(slowdown_vector)
+	## Pick min that cannot grow with new slowdown values...
+	if remaining_ways>0:
+		## Let's assume that min slowdown unfairness will not get any smaller
+		unfairness_value = max_slowdown / min(slowdown_vector[0:len(solution)])
+	else:
+		unfairness_value = max_slowdown / min(slowdown_vector)
+
+	unfairness_value=round(unfairness_value,3)
+	max_slowdown=round(max_slowdown,3)
+
+	return (max_slowdown,unfairness_value)
 
 ################################################################################
 ##                            FILE READING FUNCTIONS                          ##
@@ -547,7 +758,7 @@ def get_workloads_table_from_csv_gen(summary_csv_path, workloads_csv_path,separa
 	for workload in workloads:
 		for benchmark_name in workload:
 			if not benchmark_name in benchmarks_list:
-				print "Can't find benchmark name (%s) in global table" % benchmark_name
+				print("Can't find benchmark name (%s) in global table" % benchmark_name)
 				return None
 			## Get right Dframe
 			benchmark_dframe=benchmark_dict[benchmark_name]
@@ -604,7 +815,7 @@ def get_workloads_table_from_list_gen(summary_csv_path, workloads, separator=Non
 	for workload in workloads:
 		for benchmark_name in workload:
 			if not benchmark_name in benchmarks_list:
-				print "Can't find benchmark name (%s) in global table" % benchmark_name
+				print("Can't find benchmark name (%s) in global table" % benchmark_name)
 				return None
 			## Get right Dframe
 			benchmark_dframe=benchmark_dict[benchmark_name]
@@ -762,6 +973,9 @@ def get_max_mu(benchmark, current_benchmark_ways, available_ways, max_nr_ways, u
 
 # Same parameters as lookahead_algorithm_gen but using an array of curves as a parameter
 def lookahead_algorithm_gen(curves, nr_ways):
+	if isinstance(curves, map):
+		curves = list(curves)
+
 	solution = []
 	available_ways = nr_ways
 	there_is_maximal_marginal = True
@@ -793,7 +1007,7 @@ def lookahead_algorithm_gen(curves, nr_ways):
 	# If there are available ways yet, allocate remaining ways fairly
 	if available_ways > 0:
 		n_apps=len(curves)
-		nr_fair_ways_per_benchmark = available_ways / n_apps
+		nr_fair_ways_per_benchmark = available_ways // n_apps
 		remaining_ways = available_ways % n_apps
 		i = 0
 
@@ -964,13 +1178,16 @@ def generate_possible_clusters_nofilter(collection):
 		yield [[ first ]] + smaller
 
 
-def generate_possible_clusters(collection,nr_ways):
+def generate_possible_clusters(collection,nr_ways,max_cluster=0):
+	if max_cluster==0:
+		max_cluster=len(collection)
+
 	if len(collection) == 1:
 		yield [ collection ]
 		return
 
 	first = collection[0]
-	for smaller in generate_possible_clusters(collection[1:],nr_ways):
+	for smaller in generate_possible_clusters(collection[1:],nr_ways,max_cluster):
 		size_clustering=len(smaller)
 
 		##Unfeasible solution
@@ -980,7 +1197,8 @@ def generate_possible_clusters(collection,nr_ways):
 		# insert `first` in each of the subpartition's subsets
 		# This does not make the clustering any bigger
 		for n, subset in enumerate(smaller):
-			yield smaller[:n] + [[ first ] + subset]  + smaller[n+1:]
+			if len(subset)< max_cluster:
+				yield smaller[:n] + [[ first ] + list(subset)]  + smaller[n+1:]
 		
 		# put `first` in its own subset if that does not make it grow
 		if size_clustering<nr_ways:
@@ -1000,6 +1218,42 @@ def determine_number_of_cluster_cache_partitioning(nr_ways,nr_items_in_set):
 
 	return nr_options	
 
+def generate_possible_mappings(collection,min_items,max_items,max_groups,level=1):
+	if len(collection) == 1:
+		yield [ collection ]
+		return
+
+	first = collection[0]
+	for smaller in generate_possible_mappings(collection[1:],min_items,max_items,max_groups,level+1):  
+		# insert `first` in each of the subpartition's subsets
+		#if level==1:
+		#    set_trace()
+		if len(smaller)>max_groups:
+			continue
+		for n, subset in enumerate(smaller):
+			if len(subset)< max_items:
+				left=smaller[:n]
+				right=smaller[n+1:]
+				unfeasible=False
+				if level==1:
+					i=0
+					m=len(left)
+					while not unfeasible and i<m:
+						if len(left[i])<min_items:
+							unfeasible=True
+						i=i+1
+					i=0
+					m=len(right)
+					while not unfeasible and i<m:
+						if len(right[i])<min_items:
+							unfeasible=True
+						i=i+1
+				if not unfeasible:                    
+					yield left[:n] + [[ first ] + list(subset)]  + right
+		
+				# put `first` in its own subset if that it is allowed
+		if  (len(smaller)<max_groups) and ((level==1 and min_items==1) or (level>1)):
+			yield [[ first ]] + smaller
 
 # Private function that implements lookahead algorithm.
 # Params: Apps data dictionary and total slots.
@@ -1142,6 +1396,7 @@ def yu_petrov_algorithm(workload, bandwidth_reduction_table, nr_ways, threshold 
 def get_partition_masks(partition_sizes):
 	next_available_way=0
 	masks=[]
+	partition_sizes = list(map(int, partition_sizes))
 	for size in partition_sizes:
 		masks.append(hex(((1<<size)-1)<<next_available_way))
 		next_available_way=next_available_way+size
@@ -1158,10 +1413,12 @@ def get_equal_llc_schedule(nr_partitions, nr_ways):
 	for i in range(nr_partitions):
 		if nr_extra_ways>0:
 			ways_this_app=nr_fair_ways+1
-			nr_extra_ways=nr_extra_ways-1		
+			nr_extra_ways-=1		
 		else:
 			ways_this_app=nr_fair_ways
 
+		# Round down the number of ways assigned
+		ways_this_app = int(ways_this_app)
 		solution.append(ways_this_app)
 	return solution
 
@@ -1335,6 +1592,8 @@ def set_global_properties(key_vals):
 	if "bw_model" in key_vals:
 		select_bw_model(key_vals["bw_model"])
 
+	if "topology" in key_vals:
+		select_topology(key_vals["topology"])
 
 	if "broadcast" in key_vals and key_vals["broadcast"]:
 		com=EngineCommunicator()
@@ -1494,7 +1753,7 @@ def get_optimal_schedule(benchmark_set, cost_function, maximize, nr_ways, max_ba
 	## To make things simpler
 	bound=kwargs["bound"]
 	print_times=kwargs["print_times"]
-	async=kwargs["async"]
+	asyncr=kwargs["async"]
 	chunk=kwargs["chunk"]
 	prepruning=kwargs["prepruning"]
 	postpruning=kwargs["postpruning"]
@@ -1504,12 +1763,12 @@ def get_optimal_schedule(benchmark_set, cost_function, maximize, nr_ways, max_ba
 
 	## Disable options that do not make sense
 	if parallel_debug:
-		async=False
+		asyncr=False
 
 	if not bound:
 		prepruning=False
 
-	if not async:
+	if not asyncr:
 		paraver=False
 
 	if not prepruning:
@@ -1571,7 +1830,7 @@ def get_optimal_schedule(benchmark_set, cost_function, maximize, nr_ways, max_ba
 
 
 		lview = rc.load_balanced_view()
-		lview.block = not async		
+		lview.block = not asyncr		
 
 		# DEBUG code to check if variables are being set all right
 		# ret = lview.map(lambda x: get_global_property(x),[3]*nr_engines, block=True)
@@ -1583,7 +1842,7 @@ def get_optimal_schedule(benchmark_set, cost_function, maximize, nr_ways, max_ba
 
 		if log_enabled:
 			if print_times and paraver:
-				print >> sys.stderr, "Activated paraver trace generation"
+				print("Activated paraver trace generation", file=sys.stderr)
 			trace = []
 			unlocalized_start = pytz.utc.localize(datetime.datetime.utcnow())
 			start_datet = unlocalized_start.astimezone(pytz.timezone("utc"))
@@ -1615,7 +1874,7 @@ def get_optimal_schedule(benchmark_set, cost_function, maximize, nr_ways, max_ba
 					else:	
 						promising= lview.map(lambda x: subsol_is_promising_parallel(best_cost,x), subsols,chunksize=chunkval)
 
-					if async:
+					if asyncr:
 						promising.get()
 
 						if paraver:
@@ -1650,7 +1909,7 @@ def get_optimal_schedule(benchmark_set, cost_function, maximize, nr_ways, max_ba
 			else:
 				str_merge=" "
 
-			print >> sys.stderr, "Unroll/Preprune/Merge time: %s (Pruning rate: %s out of %d)%s" % (sim_time,len(clusters),nr_initial_solutions, str_merge)
+			print("Unroll/Preprune/Merge time: %s (Pruning rate: %s out of %d)%s" % (sim_time,len(clusters),nr_initial_solutions, str_merge), file=sys.stderr)
 
 		if postpruning:
 			if log_enabled:
@@ -1663,7 +1922,7 @@ def get_optimal_schedule(benchmark_set, cost_function, maximize, nr_ways, max_ba
 			if log_enabled:
 				end = datetime.datetime.utcnow()
 				if print_times:
-					print >> sys.stderr, "Postpruning split: %s (Goes from %d to %d solutions)" % (str(round((end - start).total_seconds(),4)),old_clusters,len(clusters))
+					print("Postpruning split: %s (Goes from %d to %d solutions)" % (str(round((end - start).total_seconds(),4)),old_clusters,len(clusters)), file=sys.stderr)
 
 
 			if paraver:
@@ -1696,11 +1955,11 @@ def get_optimal_schedule(benchmark_set, cost_function, maximize, nr_ways, max_ba
 				for x in clusters[min_idx:max_idx]:
 					sol=get_optimal_schedule_aux_multi(benchmark_set, cost_function, max_bandwidth, best_cost, op, nr_ways , x, bound)
 					local_node_solutions.append(sol)
-					print sol
+					print(sol)
 			else:			
 				local_node_solutions = lview.map(lambda x: get_optimal_schedule_aux_multi_parallel(best_cost,x,(min_idx!=0) or (not prepruning) or (postpruning)), clusters[min_idx:max_idx])	
 
-			if async: 
+			if asyncr: 
 				## Now local_node_solutions is an AsyncMapResult object. But it can be iterated.
 				## Wait for completion.... invoking get (later we'll use metadata!)
 				d=local_node_solutions.get()
@@ -1709,9 +1968,9 @@ def get_optimal_schedule(benchmark_set, cost_function, maximize, nr_ways, max_ba
 			if log_enabled:
 				end = time.time()
 				if print_times:
-					print >> sys.stderr, "Parallel computation: %s" % str(round(end - start,4))
+					print("Parallel computation: %s" % str(round(end - start,4)), file=sys.stderr)
 
-				if async:
+				if asyncr:
 					## https://ipyparallel.readthedocs.io/en/latest/details.html#extended-interface
 					##Extract metadata
 					metadata=local_node_solutions.metadata
@@ -1721,7 +1980,7 @@ def get_optimal_schedule(benchmark_set, cost_function, maximize, nr_ways, max_ba
 						#transfer_time=(stats['started']-stats['submitted']).total_seconds()+(stats['received']-stats['completed']).total_seconds()
 						total_time=(stats['received']-stats['submitted']).total_seconds()
 						if print_times:
-							print  >> sys.stderr, clusters[low_idx+i],"%i,%i,%.4f,%.4f" % (i,stats['engine_id'],computation_time,total_time),local_node_solutions[i],stats["stdout"]
+							print(clusters[low_idx+i],"%i,%i,%.4f,%.4f" % (i,stats['engine_id'],computation_time,total_time),local_node_solutions[i],stats["stdout"], file=sys.stderr)
 						if paraver:							
 							start_micros=int((stats["started"]-start_datet).total_seconds()*1000000)
 							if i == 0:
@@ -1748,7 +2007,7 @@ def get_optimal_schedule(benchmark_set, cost_function, maximize, nr_ways, max_ba
 			if log_enabled:
 				end = datetime.datetime.utcnow()
 				if print_times:
-					print >> sys.stderr, "Sequential reduction: %s" % str(round((end - start).total_seconds(),4))
+					print("Sequential reduction: %s" % str(round((end - start).total_seconds(),4)), file=sys.stderr)
 
 				if paraver:
 					(start_micros,end_micros)=get_start_end_micros(start,end,start_datet)
@@ -2199,7 +2458,7 @@ def bb_process_node_result(task,props):
 
 	## Get result
 	(nodes_lbs,this_sol,this_cost,node_count)=task.get()
-	#print task.stdout
+	#print(task.stdout)
 
 	## Get metadata
 	if "trace" in props:
@@ -2277,7 +2536,7 @@ def bb_process_leaf_node(benchmark_set, cost_function, max_bandwidth, default_co
 	return (best_solution,best_cost,total_nodes_expanded)	
 
 
-def  bb_node_processing_aux(benchmark_set, cost_function, max_bandwidth, engine_solution, nr_ways, partial_solution,nr_clusters,lower_bound,**kwargs):
+def bb_node_processing_aux(benchmark_set, cost_function, max_bandwidth, engine_solution, nr_ways, partial_solution,nr_clusters,lower_bound,**kwargs):
 	best_solution=None
 	remain_nr_ways=nr_ways-sum(partial_solution)
 	total_nodes_expanded=0
@@ -2318,18 +2577,18 @@ def  bb_node_processing_aux(benchmark_set, cost_function, max_bandwidth, engine_
 
 			## Optimization: Detect terminal nodes automatically and record solution if better
 			if bb_is_leaf_node(new_partial_solution,nr_clusters,nr_ways):
-					## Process leaf node
-					(new_solution,this_cost,count)=bb_process_leaf_node(benchmark_set, cost_function, max_bandwidth, engine_solution.cost, engine_solution.op, nr_ways, new_partial_solution, nr_clusters)
+				## Process leaf node
+				(new_solution,this_cost,count)=bb_process_leaf_node(benchmark_set, cost_function, max_bandwidth, engine_solution.cost, engine_solution.op, nr_ways, new_partial_solution, nr_clusters)
 
-					if count==0:
-						raise Exception('pete')
+				if count==0:
+					raise Exception('pete')
 
-					## Update best cost if necessary
-					total_nodes_expanded=+1
-					if not new_solution is None:
-						## Update local incumbent 
-						engine_solution.update(new_solution,this_cost)
-						best_solution = new_solution
+				## Update best cost if necessary
+				total_nodes_expanded=+1
+				if not new_solution is None:
+					## Update local incumbent 
+					engine_solution.update(new_solution,this_cost)
+					best_solution = new_solution
 
 			else:
 				this_lower_bound=cost_function(benchmark_set, new_partial_solution, max_bandwidth, remaining_ways)
@@ -2337,7 +2596,7 @@ def  bb_node_processing_aux(benchmark_set, cost_function, max_bandwidth, engine_
 				total_nodes_expanded+=1
 
 				## Prune
- 				if engine_solution.is_better(this_lower_bound):
+				if engine_solution.is_better(this_lower_bound):
 					continue
 				else:
 					## Enqueue
@@ -2367,16 +2626,16 @@ def bb_break_into_subnodes(node,nr_clusters, total_nr_ways, max_children):
 			subnodes=[]
 			## Loop
 			low_limit=1
-			## Round up
-			nr_partitions=(num_children+(max_children-1))/max_children
-			for i in  range(nr_partitions):
+			## Round up -------> in Python2 it was coded as (express.)/max_children, which gives only the int part of division, so it always rounds down 
+			nr_partitions=(num_children+(max_children-1))//max_children
+			for i in range(nr_partitions):
 				high_limit=min(low_limit+max_children,num_children+1)
 				subnodes.append((node,low_limit,high_limit))
 				low_limit=high_limit
 
 			return subnodes
 
-def  bb_subnode_processing(benchmark_set, cost_function, max_bandwidth, engine_solution, nr_ways, subnode ,nr_clusters, max_children,lower_bound,**kwargs):
+def bb_subnode_processing(benchmark_set, cost_function, max_bandwidth, engine_solution, nr_ways, subnode ,nr_clusters, max_children,lower_bound,**kwargs):
 	best_solution=None
 	total_nodes_expanded=0
 	(partial_solution, low_limit, high_limit)=subnode
@@ -2440,7 +2699,7 @@ def  bb_subnode_processing(benchmark_set, cost_function, max_bandwidth, engine_s
 				total_nodes_expanded+=1
 
 				## Prune
- 				if engine_solution.is_better(this_lower_bound):
+				if engine_solution.is_better(this_lower_bound):
 					continue
 				else:
 					## Break down into subnodes and enqueue....
@@ -2586,7 +2845,7 @@ def bb_process_pending(pending_tasks, pending_lbs,bb_props,op, completed=None):
 	deleted=0
 	better_solution_found=False
 	best_solution=bb_props["best_solution"]
-
+	
 	if completed is None:
 		## First stage (check pending tasks that completed)
 		for task in pending_tasks[:]:
@@ -2604,11 +2863,11 @@ def bb_process_pending(pending_tasks, pending_lbs,bb_props,op, completed=None):
 		for task in completed:
 			i=pending_tasks.index(task)
 			if i==-1 or not task.ready():
-				print "Error"
+				print("Error")
 				exit(1)
 			if bb_process_node_result(task,bb_props):
 				better_solution_found=True
-			del pending_tasks[i]	
+			del pending_tasks[i]
 			del pending_lbs[i]
 			deleted=deleted+1
 
@@ -2623,16 +2882,27 @@ def bb_process_pending(pending_tasks, pending_lbs,bb_props,op, completed=None):
 def bb_generate_solutions_to_explore(nr_ways,nr_apps,target_count):
 	
 	queue=[[]]
+	leaves=[]
+	nodes_found=0
 
-	while len(queue)<target_count:
+	while queue and nodes_found<target_count:
 		node=queue.pop(0)
 		level=len(node)
-                nr_remaining_ways=nr_ways-sum(node)
-		for nr_ways_assigned in range(1, nr_remaining_ways- (nr_apps - level - 1) + 1):
-			subsol=node+[nr_ways_assigned]
-			queue.append(subsol)
+		nr_remaining_ways=nr_ways-sum(node)
 
-	return queue
+		if nr_remaining_ways>0:
+			## We will expand one node (so it is no longer in queue)
+			nodes_found-=1
+			for nr_ways_assigned in range(1, nr_remaining_ways- (nr_apps - level - 1) + 1):
+				subsol=node+[nr_ways_assigned]
+				queue.append(subsol)
+				nodes_found+=1
+		else:
+			## Push in leaves
+			leaves.append(node)
+			nodes_found+=1
+
+	return queue+leaves
 
 ## Single-workload pruning
 def determine_lower_bound(benchmark_set, cost_function, max_bandwidth, default_cost, op, nr_ways, partial_solution,**kwargs):
@@ -2750,7 +3020,7 @@ def get_optimal_schedule_bf_par(benchmark_set, cost_function, max_bandwidth, def
 		peers[nr_engines]=com.info()
 
 		if debug:
-			print peers
+			print(peers)
 
 		## Start communicator remotely
 		dview.apply_sync(lambda x: start_communicator(x),peers)
@@ -2844,7 +3114,7 @@ def get_optimal_schedule_bf_par(benchmark_set, cost_function, max_bandwidth, def
 					best_solution.update(new_solution,this_cost, broadcast=False) 
 
 					if debug:
-						print "New solution found:", new_solution, this_cost 
+						print("New solution found:", new_solution, this_cost)
 					bb_prune_pending(pending_tasks, pending_lbs,best_solution)
 
 			elif (ps_lower_bound is None) or best_solution.is_worse(ps_lower_bound):
@@ -2859,7 +3129,7 @@ def get_optimal_schedule_bf_par(benchmark_set, cost_function, max_bandwidth, def
 				tasks_submitted=tasks_submitted+1
 			else:
 				if debug:
-					print "Task pruned in origin"
+					print("Task pruned in origin")
 
 
 		if tasks_submitted==0 and pending_tasks:
@@ -3050,7 +3320,9 @@ def whirlpool_combined_curve(mrc1, mrc2):
 		buckets.append((b1,cur_ways+1-b1))
 	return mrc,buckets
 
+
 def whirlpool_combine_ncurves_f(mrcs,nr_ways):
+	mrcs=list(mrcs)
 	nr_apps = len(mrcs)
 	indexes = [0.0 for i in range(nr_apps)]
 	mrc = []
@@ -3070,7 +3342,6 @@ def whirlpool_combine_ncurves_f(mrcs,nr_ways):
 			cur_buckets.append(app_bucket)
 		buckets.append(cur_buckets)
 	return (mrc,buckets)
-
 
 def whirlpoolc_combine_ncurves_f(mrcs,llcmpkcs,nr_ways,agg_function=sum):
 	nr_apps = len(mrcs)
@@ -3226,6 +3497,7 @@ class Cluster:
 
 		return (distance_sum,combined_curve,buckets,partitioned_curve)	
 
+
 	def distance_gen(self,cluster2,metric="llcmpki",metric_space="llcmpki",agg_function=sum,use_abs=True,fix_partitioned=True):
 		curves=[]
 		space_curves=[]
@@ -3260,6 +3532,7 @@ class Cluster:
 		for nr_ways in range(1,len(self.curve)+1):
 			if nr_ways>1:
 				ways_distr = lookahead_algorithm_gen(pcurves,nr_ways)
+				ways_distr = list(map(int, ways_distr))
 				values_partitioned=[]
 				for idxapp,assigned_ways in enumerate(ways_distr):
 					values_partitioned.append(pcurves[idxapp][assigned_ways])
@@ -3269,14 +3542,17 @@ class Cluster:
 
 			partitioned_curve.append(new_value)
 
+		distance_curve=[]
 		distance_sum = 0
 		for i in range(len(self.curve)):
 			if use_abs:
 				distance_sum += abs(combined_curve[i] - partitioned_curve[i])
 			else:
 				distance_sum += combined_curve[i] - partitioned_curve[i]
+			distance_curve.append(distance_sum)
 
-		return (distance_sum,combined_curve,buckets,partitioned_curve)		
+		return (distance_sum,combined_curve,buckets,partitioned_curve,distance_curve)		
+
 
 	def slowdown_distance(self,cluster2):
 		return self.distance_gen(cluster2,metric="slowdown",metric_space="llcmpkc",agg_function=max,use_abs=False)
@@ -3499,7 +3775,7 @@ def get_kpart_schedule_optimized(workload,nr_ways,max_bandwidth=float('Inf'),uop
 		for j in range(i+1,len(curClusters)):
 			cluster=curClusters[j]
 			idx_j=cluster.idx_cluster
-			(distance,combined_curve,buckets,partitioned_curve)=clusterRef.distance_gen(cluster,metric="slowdown",metric_space="llcmpkc",agg_function=raw_unfairness,use_abs=False)
+			(distance,combined_curve,buckets,partitioned_curve,distance_curve)=clusterRef.distance_gen(cluster,metric="slowdown",metric_space="llcmpkc",agg_function=raw_unfairness,use_abs=False)
 			##Store in matrices
 			distance_matrix[idx_i,idx_j]=distance
 			kpart_curves[idx_i][idx_j]=(combined_curve,buckets,partitioned_curve,clusterRef,cluster)
@@ -3523,11 +3799,11 @@ def get_kpart_schedule_optimized(workload,nr_ways,max_bandwidth=float('Inf'),uop
 			elif cluster.idx_cluster == clusterB.idx_cluster:
 				min_idx[1]=idx
 
-		print "***Iteration %d***" % it
-		print distance_matrix
-		print distance
-		print "Selection:",clusterA,clusterB
-		print "***********************************"
+		print("***Iteration %d***" % it)
+		print(distance_matrix)
+		print(distance)
+		print("Selection:",clusterA,clusterB)
+		print("***********************************")
 		it=it+1
 
 		## Merge 2 closest clusters
@@ -3565,7 +3841,7 @@ def get_kpart_schedule_optimized(workload,nr_ways,max_bandwidth=float('Inf'),uop
 						(idx_i,idx_j)=(idx_other,idx_new)
 						(cluster_i,cluster_j)=(cluster,new_cluster)
 		
-					(distance,combined_curve,buckets,partitioned_curve)=cluster_i.distance_gen(cluster_j,metric="slowdown",metric_space="llcmpkc",agg_function=raw_unfairness,use_abs=False)
+					(distance,combined_curve,buckets,partitioned_curve,distance_curve)=cluster_i.distance_gen(cluster_j,metric="slowdown",metric_space="llcmpkc",agg_function=raw_unfairness,use_abs=False)
 		
 					##Store in matrices
 					distance_matrix[idx_i,idx_j]=distance
@@ -3619,10 +3895,10 @@ def get_kpart_best_gen(workload,nr_ways,max_bandwidth=float('Inf'),debugging=Fal
 		for sol in solutions:
 			clusters,(partitioning,per_app_partitioning,bw_app,sp_aggregate) = sol
 			bw_app = [(bw,app.name) for (bw,app) in bw_app]
-			print clusters, sp_aggregate
+			print (clusters, sp_aggregate)
 			#(workload_alt,solution_alt)=zip(*per_app_partitioning)
 			#print sp_aggregate, unfairness(list(workload_alt),list(solution_alt),max_bandwidth), clusters, partitioning, list(solution_alt)
-		print "Best k =",k
+		print("Best k =",k)
 
 	best_sol=solutions[k]
 	clusters=best_sol[0]
@@ -3661,6 +3937,7 @@ def get_kpart_best(workload,nr_ways,max_bandwidth=float('Inf'),debugging=False):
 ## Return list of "Shadow" apps with the hacked properties...
 def get_scaled_properties_cluster(cluster, max_ways, metric="llcmpkc"):
 	## Caso trivial...
+	cluster = list(cluster)
 	if len(cluster)==1:
 		return cluster
 	## Get MRC for each APP
@@ -3674,6 +3951,85 @@ def get_scaled_properties_cluster(cluster, max_ways, metric="llcmpkc"):
 		hacked_apps.append(App(app.name,props,app))
 
 	return hacked_apps
+
+
+# Function that scales down the metric tables of each cluster in an array to a specific number of ways
+# Params: Array of clusters and number of ways
+# Return: Scaled clusters and apps
+def get_patched_clustering_and_workload(clustering,nr_ways):
+	patched_apps=[]
+	patched_clustering=[]	
+	
+	for cluster in clustering:
+		patched_cluster=get_scaled_properties_cluster(cluster,nr_ways)
+		patched_apps.extend(patched_cluster)
+		patched_clustering.append(patched_cluster)
+
+	return (patched_clustering,patched_apps)
+
+
+# Function that normalizes the output for a given clustering solution
+def normalize_output_for_clustering_solution(workload,clusters,clustering_sol,nr_ways,llc_mapping=False):
+	for i,app in enumerate(workload):
+		app.bench_id = i
+		
+	## Calculate patched apps and so on
+	(patched_clustering,patched_apps)=get_patched_clustering_and_workload(clusters,nr_ways)
+
+	if 	llc_mapping:
+		##Set cache ids... based on clusters
+		cache_id=0
+		per_cluster_masks=[]
+		for clust in patched_clustering:
+			per_cluster_masks.append(hex((1<<nr_ways)-1))
+			for app in clust:
+				app.llc_id=cache_id
+			cache_id+=1
+
+			## Each llc id can be considered its own mask...
+
+	else:
+		## First determine the LLC ID associated with each cluster
+		## and treat each thing separately
+		llc_cluster_ids=[]
+		for clust in patched_clustering:
+			cluster_llcid=clust[0].llc_id
+			if cluster_llcid==-1:
+				cluster_llcid=0 ## Normalize
+			llc_cluster_ids.append(cluster_llcid)
+
+		## Build cool stuff
+		clustering_partial_solutions=[[] for i in range(len(llc_cluster_ids))]
+		for i,clust in enumerate(patched_clustering):
+			cluster_llcid=llc_cluster_ids[i]
+			clustering_partial_solutions[cluster_llcid].append(clustering_sol[i])
+
+		per_cluster_masks=[]
+		for psol in clustering_partial_solutions:
+			per_cluster_masks.extend(get_partition_masks(psol))
+
+	per_app_masks = [None] * len(patched_apps)
+	per_app_ways = [None] * len(patched_apps)
+	cluster_ids = [None] * len(patched_apps)
+	patched_workload=[None]*len(patched_apps)
+
+	## Build per app ways and per app masks
+	for i,cluster in enumerate(patched_clustering):
+		cluster_ways=clustering_sol[i]
+		cluster_mask=per_cluster_masks[i]
+		for app in cluster:
+			orig_i = app.original_app.bench_id
+			per_app_ways[orig_i] = cluster_ways
+			per_app_masks[orig_i] = cluster_mask
+			cluster_ids[orig_i] = i
+
+	for app in patched_apps:
+		orig_i = app.original_app.bench_id
+		#print orig_i,app
+		patched_workload[orig_i] = app
+
+	return (patched_workload,per_app_ways,per_app_masks,cluster_ids)
+
 
 def write_rewind(fd, val):
 	os.write(fd,val)
@@ -3701,7 +4057,7 @@ def get_user_assignment(workload,nr_ways,workload_name,**kwargs):
 	workloads_assignment = kwargs["user_assignment"]
 	w_id = int(workload_name.strip("W"))-1
 	if w_id > len(workloads_assignment):
-		print "Your user-sched file has not enough workloads specified w.r.t. your workload.csv file"
+		print("Your user-sched file has not enough workloads specified w.r.t. your workload.csv file")
 		exit(1)
 	(per_app_ways,per_app_masks,cluster_id) = workloads_assignment[w_id]
 
@@ -3727,7 +4083,7 @@ if __name__ == "__main__":
 #	exit(0)
 	#bb_generate_solutions_to_explore(20,6,28)
 	subnodes=bb_break_into_subnodes([2],4,20,5)
-	print subnodes
+	print(subnodes)
 	#write_dot_tree(6,4)
 	#print determine_number_of_cluster_cache_partitioning(20,20)
 	#nsols=number_of_solutions_partitioning_dp(11,4)		
