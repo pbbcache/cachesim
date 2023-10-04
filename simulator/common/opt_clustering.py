@@ -19,6 +19,7 @@
 # You should have received a copy of the GNU General Public License
 # along with this program.  If not, see <http://www.gnu.org/licenses/>.
 from simulator_core import *
+import simulator_exploration as se
 import datetime
 import pytz
 
@@ -55,27 +56,12 @@ def plain_names(apps,cluster):
 def get_application_clustering_from_app_ids(numeric_clustering,workload):
 	clustering=[]
 	for nclust in numeric_clustering:
-		cluster=map(lambda id_app: workload[id_app],nclust)
+		cluster=list(map(lambda id_app: workload[id_app],nclust))
 		clustering.append(cluster)
 	return clustering
 
-# Function that scales down the metric tables of each cluster in an array to a specific number of ways
-# Params: Array of clusters and number of ways
-# Return: Scaled clusters and apps
-def get_patched_clustering_and_workload(clustering,nr_ways):
-	patched_apps=[]
-	patched_clustering=[]	
-	
-	for cluster in clustering:
-		patched_cluster=get_scaled_properties_cluster(cluster,nr_ways)
-		patched_apps.extend(patched_cluster)
-		patched_clustering.append(patched_cluster)
-
-	return (patched_clustering,patched_apps)
-
 # Function that calculates the best cost and best part solution for the clustering (no patched apps).
 def determine_optimal_partitioning_for_clustering(num_clustering, workload, cost_function, max_bandwidth, best_cost, maximize, nr_ways , uoptions, multiprocessing=False,use_bf=True,**kwargs):
-
 	## Transform low-level numeric representation into list of lists of object
 	clustering=get_application_clustering_from_app_ids(num_clustering,workload)
 
@@ -85,18 +71,89 @@ def determine_optimal_partitioning_for_clustering(num_clustering, workload, cost
 	## Discard solutions that include more applications than ways
 	## This should not occur
 	assert(len(clustering)<=nr_ways)
-			
-	(patched_clustering,patched_apps)=get_patched_clustering_and_workload(clustering,nr_ways)
-		
-	#print plain_names(patched_apps,patched_clustering)
 
+	#################################################
+	## CRITICAL FOR THE BW MODEL TO WORK CORRECTLY
+	if kwargs["opt_mapping"]:
+		## If mapping update LLC ID before patch
+		for i,cluster in enumerate(clustering):
+			## Set LLC ID for each app in subworkload
+			for app in cluster:
+				app.llc_id=i
+	##################################################
+
+	#print plain_names(patched_apps,patched_clustering)
+	cp=kwargs["cache_part"]
+	global_optimal=(kwargs["opt_mapping"]) and (type(cp) is str) and (cp.startswith("optc-"))
+		
 	## Optimization for trivial case
-	if len(patched_clustering)==1:
+	if len(clustering)==1:
 		local_solution=[nr_ways]
+		(patched_clustering,patched_apps)=get_patched_clustering_and_workload(clustering,nr_ways)
 		local_branches=1
 		local_cost=cost_function((patched_apps,patched_clustering),local_solution, max_bandwidth)
 		return (local_cost,local_solution,local_branches)
+	elif kwargs["opt_mapping"]:
+		if kwargs["cache_part"]=="lfoc+":
+			local_branches=1
+			lfoc_uoptions=kwargs.copy()
+			lfoc_uoptions.update(uoptions)
+			lfoc_uoptions["use_pair_clustering"]=True
+			lfoc_uoptions["simple_output"]=True	
+	
+			clusters_part=[]
+			way_distribution=[]
+			## Get the original apps and apply LFOC for each LLC_ID
+			## Each cluster is a separate LLC
+			for cluster in clustering:
+				subworkload=[app for app in cluster]
+				## Invoke LFOC+ for that
+				(subclusters,llc_way_distr)=se.lfoc(subworkload,nr_ways,max_bandwidth,lfoc_uoptions)	
+				clusters_part.extend(subclusters)
+				way_distribution.extend(llc_way_distr)
+
+			(patched_clustering,patched_apps)=get_patched_clustering_and_workload(clusters_part,nr_ways)
+			local_solution=way_distribution
+		elif global_optimal:
+			clusters_part=[]
+			way_distribution=[]
+			optc_uoptions=kwargs.copy()
+			optc_uoptions.update(uoptions)
+			local_branches=0
+
+			for i,cluster in enumerate(clustering):
+				subworkload=[]
+				## disable for now
+				for app in cluster:
+					app.llc_id=-1
+					subworkload.append(app)
+				## Invoke Sequential optimal for that
+				(subclusters,llc_way_distr,this_branch)=get_optimal_clustering_seq(subworkload,cost_function,maximize,nr_ways,max_bandwidth,False,simple_output=True,user_options=optc_uoptions)	
+				local_branches=local_branches+this_branch
+				## Reestablish llc_ids
+				for scluster in  subclusters:
+					for app in scluster:
+						app.llc_id=i
+
+				clusters_part.extend(subclusters)
+				way_distribution.extend(llc_way_distr)				
+			
+			##Obtain patched global solution 
+			(patched_clustering,patched_apps)=get_patched_clustering_and_workload(clusters_part,nr_ways)
+			local_solution=way_distribution
+							
+		else:
+			(patched_clustering,patched_apps)=get_patched_clustering_and_workload(clustering,nr_ways)
+			local_branches=1
+			## All ways in each llc
+			local_solution=[nr_ways for i in range(len(patched_clustering))]
+
+		local_cost=cost_function((patched_apps,patched_clustering),local_solution, max_bandwidth)		
+
+			
+		return (local_cost,local_solution,local_branches)
 	else:
+		(patched_clustering,patched_apps)=get_patched_clustering_and_workload(clustering,nr_ways)
 		## Determine initial solution UCP-Slowdown for cluster
 		ucp_solution=ucp_clustering_solution(patched_clustering,nr_ways)
 		
@@ -147,6 +204,7 @@ def determine_optimal_partitioning_for_clustering_mp2(arg):
 
 	return determine_optimal_partitioning_for_clustering(**params)
 
+
 # Function that goes through an array of solutions and decides which one is best to be returned
 def reduce_solutions(clusts, sols, op, best_solution , best_cost, total_branches):
 	
@@ -167,38 +225,6 @@ def reduce_solutions(clusts, sols, op, best_solution , best_cost, total_branches
 
 	return (best_solution,best_cost, total_branches)
 
-# Function that normalizes the output for a given clustering solution
-def normalize_output_for_clustering_solution(workload,clusters,clustering_sol,nr_ways):
-	for i,app in enumerate(workload):
-		app.bench_id = i
-		
-	## Calculate patched apps and so on
-	(patched_clustering,patched_apps)=get_patched_clustering_and_workload(clusters,nr_ways)
-
-	## Build per cluster masks
-	per_cluster_masks=get_partition_masks(clustering_sol)
-
-	per_app_masks = [None] * len(patched_apps)
-	per_app_ways = [None] * len(patched_apps)
-	cluster_ids = [None] * len(patched_apps)
-	patched_workload=[None]*len(patched_apps)
-
-	## Build per app ways and per app masks
-	for i,cluster in enumerate(patched_clustering):
-		cluster_ways=clustering_sol[i]
-		cluster_mask=per_cluster_masks[i]
-		for app in cluster:
-			orig_i = app.original_app.bench_id
-			per_app_ways[orig_i] = cluster_ways
-			per_app_masks[orig_i] = cluster_mask
-			cluster_ids[orig_i] = i
-
-	for app in patched_apps:
-		orig_i = app.original_app.bench_id
-		#print orig_i,app
-		patched_workload[orig_i] = app
-
-	return (patched_workload,per_app_ways,per_app_masks,cluster_ids)
 
 # Function to process the exploration results and update the upper bound if a better solution is found
 def clustering_process_result(task,clust,props,op):
@@ -212,7 +238,10 @@ def clustering_process_result(task,clust,props,op):
 	better_solution=True
 
 	## Get result
-	(this_cost,this_sol,node_count)=task.get()
+	# If something errors out in one of the engines, the get() method is going to give poor error messages. 
+	# All relevant information (errors, stdout) will be stored in task.metadata (see AsyncResult class)
+	# Stack trace at: task.metadata['error'].print_traceback() or also task._exception.print_traceback()
+	(this_cost,this_sol,node_count)=task.get() 
 
 	## Get metadata
 	if "trace" in props:
@@ -227,8 +256,8 @@ def clustering_process_result(task,clust,props,op):
 			props["upper_bound"] = this_cost
 			## Better solution includes the numeric clustering spec
 			props["incumbent"] =  (clust, this_sol)
-			#print "New solution found:", this_sol,this_cost
-			better_solution=True
+			#print("New solution found:", clust,this_sol,this_cost)
+			better_solution=True	
 
 	return better_solution
 
@@ -255,7 +284,7 @@ def clust_process_pending(pending_tasks, num_clusts, clust_props,op, completed=N
 		for task in completed:
 			i=pending_tasks.index(task)
 			if i==-1 or not task.ready():
-				print "Error"
+				print("Error")
 				exit(1)
 			if clustering_process_result(task,clust_props,op):
 				better_solution_found=True
@@ -277,28 +306,31 @@ def get_optimal_clustering(workload, cost_function, maximize, nr_ways, max_bandw
 	kwargs.setdefault("async",False)
 	kwargs.setdefault("sol_threshold", 20)
 	kwargs.setdefault("paraver",False)
-
+	kwargs.setdefault("max_cluster_size",len(workload))
+	kwargs.setdefault("opt_mapping", False)
+	kwargs.setdefault("cache_part",None)	
 	uoptions=kwargs["user_options"]
 
 	if uoptions:
 		## Merge dict with user options... [Overriding defaults...]
 		kwargs.update(uoptions)
 
-	async=kwargs["async"]
+	asyncr=kwargs["async"]
 	chunk=kwargs["chunk"]
 	sol_threshold=kwargs["sol_threshold"]
 	paraver=kwargs["paraver"]
+	max_cluster_size=kwargs["max_cluster_size"]
 
 	metadatum = {}
 
 	for i,app in enumerate(workload):
 		app.bench_id = i
 
-	if not async:
+	if not asyncr:
 		paraver=False
 
 	if paraver:
-		print >> sys.stderr, "Activated paraver trace generation"
+		print("Activated paraver trace generation", file=sys.stderr)
 		trace = []
 		start = datetime.datetime.utcnow()
 		unlocalized_start = pytz.utc.localize(datetime.datetime.utcnow())
@@ -309,7 +341,7 @@ def get_optimal_clustering(workload, cost_function, maximize, nr_ways, max_bandw
 	# Determine right operator
 	op = operator.gt if maximize else operator.lt
 
-	iterator=generate_possible_clusters(range(len(workload)),nr_ways)
+	iterator=generate_possible_clusters(range(len(workload)),nr_ways,max_cluster_size)
 
 	best_solution=None
 	best_cost=0
@@ -333,12 +365,15 @@ def get_optimal_clustering(workload, cost_function, maximize, nr_ways, max_bandw
 				  "maximize": maximize,
 				  "uoptions": uoptions,
 				  "multiprocessing": False,
-				  "bw_model": kwargs["bw_model"]}
+				  "bw_model": kwargs["bw_model"],
+				  "topology": kwargs["topology"],
+				  "opt_mapping": False,
+				  "cache_part": kwargs["cache_part"]}
 		# Copy global data
 		ret=dview.apply_sync(lambda x: set_global_properties(x),dict_globals)
 
 		lview = rc.load_balanced_view()
-		lview.block = not async
+		lview.block = not asyncr
 
 	work_to_do=0
 	tasks=[]
@@ -363,7 +398,7 @@ def get_optimal_clustering(workload, cost_function, maximize, nr_ways, max_bandw
 				# Send tasks to load balanced cluster
 				sols= lview.map(lambda x: determine_optimal_partitioning_for_clustering_mp(x,best_cost),tasks)
 
-				if async:
+				if asyncr:
 					sols.get()
 					if paraver:
 						# Mark the time that too expanding the iterator
@@ -383,7 +418,7 @@ def get_optimal_clustering(workload, cost_function, maximize, nr_ways, max_bandw
 				tasks=[]
 		else:
 			## Get optimal partitioning for that clustering solution
-			(local_cost,local_solution,local_branches)=determine_optimal_partitioning_for_clustering(num_clustering, workload, cost_function, max_bandwidth, best_cost, maximize, nr_ways , uoptions, multiprocessing=False)
+			(local_cost,local_solution,local_branches)=determine_optimal_partitioning_for_clustering(num_clustering, workload, cost_function, max_bandwidth, best_cost, maximize, nr_ways , uoptions, multiprocessing=False, **kwargs)
 			total_branches+=local_branches
 
 			if local_solution:
@@ -397,7 +432,7 @@ def get_optimal_clustering(workload, cost_function, maximize, nr_ways, max_bandw
 		# Do it
 		sols= lview.map(lambda x: determine_optimal_partitioning_for_clustering_mp(x,best_cost),tasks)
 
-		if async:
+		if asyncr:
 			sols.get()
 			if paraver:
 				metadata = sols.metadata
@@ -445,15 +480,22 @@ def get_optimal_clustering_seq(workload, cost_function, maximize, nr_ways, max_b
 
 	## Set defaults
 	kwargs.setdefault("user_options",None)
+	kwargs.setdefault("simple_output",False)
 	uoptions=kwargs["user_options"]
+
 	if uoptions:
 		## Merge dict with user options... [Overriding defaults...]
 		kwargs.update(uoptions)
 
+	if "max_cluster_size" in kwargs:
+		max_cluster_size=kwargs["max_cluster_size"]
+	else:
+		max_cluster_size=len(workload)
+
 # Determine right operator
 	op = operator.gt if maximize else operator.lt
 	
-	iterator=generate_possible_clusters(workload,nr_ways)
+	iterator=generate_possible_clusters(workload,nr_ways,max_cluster_size)
 
 	best_solution=None
 	best_cost=0
@@ -511,8 +553,19 @@ def get_optimal_clustering_seq(workload, cost_function, maximize, nr_ways, max_b
 			best_cost=local_cost
 			best_solution=(patched_apps,patched_clustering,local_solution)
 
+
 	## Prepare output
 	(patched_apps,patched_clustering,clustering_sol)=best_solution
+
+	## Plain case 
+	if kwargs["simple_output"]:
+		clean_clustering=[]
+		for cluster in patched_clustering:
+			clean_cluster=[]
+			for app in cluster:
+				clean_cluster.append(app.original_app)
+			clean_clustering.append(clean_cluster)
+		return (clean_clustering,clustering_sol,total_branches)
 
 	## Build per cluster masks
 	per_cluster_masks=get_partition_masks(clustering_sol)
@@ -541,10 +594,17 @@ def get_optimal_clustering_bf(workload, cost_function, maximize, nr_ways, max_ba
 	kwargs.setdefault("sol_threshold", 0)
 	kwargs.setdefault("paraver",False)
 	kwargs.setdefault("bw_model","simple")
+	kwargs.setdefault("topology","uma")
 	kwargs.setdefault("dyn_load_factor",2)
 	kwargs.setdefault("paraver",False)
 	kwargs.setdefault("debug",False)
 	kwargs.setdefault("print_times",False)
+	kwargs.setdefault("max_cluster_size",len(workload))
+	kwargs.setdefault("cores_per_llc",4)
+	kwargs.setdefault("max_core_groups",0) ## unlimited
+	kwargs.setdefault("opt_mapping",False)
+	kwargs.setdefault("cache_part",None)
+	kwargs.setdefault("allow_unbalanced_mapping",True)
 
 	uoptions=kwargs["user_options"]
 
@@ -562,6 +622,11 @@ def get_optimal_clustering_bf(workload, cost_function, maximize, nr_ways, max_ba
 	print_times=kwargs["print_times"]
 	debug=kwargs["debug"]
 	log_enabled=paraver or print_times
+	max_cluster_size=kwargs["max_cluster_size"]
+	cores_per_llc=kwargs["cores_per_llc"]
+	opt_mapping=kwargs["opt_mapping"]
+	max_core_groups=kwargs["max_core_groups"]
+	allow_unbalanced_mapping=kwargs["allow_unbalanced_mapping"]
 
 	metadatum = {}
 
@@ -569,7 +634,7 @@ def get_optimal_clustering_bf(workload, cost_function, maximize, nr_ways, max_ba
 
 	clust_props= { "node_queue": pq,
 							"num_clusts": num_clusts,
-						"upper_bound": None,
+						"upper_bound": 0, #previously initialized to None
 						"incumbent": None,
 						"total_nodes":0}
 
@@ -587,13 +652,73 @@ def get_optimal_clustering_bf(workload, cost_function, maximize, nr_ways, max_ba
 	# Determine right operator
 	op = operator.gt if maximize else operator.lt
 
-	iterator=generate_possible_clusters(range(len(workload)),nr_ways)
+	if opt_mapping:
+		nr_apps=len(workload)
+		if max_core_groups==0:
+			max_core_groups=(nr_apps+cores_per_llc-1)//cores_per_llc #GRAZ
 
+		if allow_unbalanced_mapping:
+			## Calculate max gaps at the end
+			cores_unused=max_core_groups*cores_per_llc-nr_apps
+
+			if cores_unused==0:
+				min_apps_llc=min(cores_per_llc,nr_apps)
+			elif cores_unused>=cores_per_llc:
+				min_apps_llc=1
+			else:
+				min_apps_llc=cores_per_llc-cores_unused
+		else:
+			min_apps_llc=nr_apps//max_core_groups 
+			if min_apps_llc==0:
+				min_apps_llc=min(cores_per_llc,nr_apps)
+
+			
+		max_apps_llc=min(cores_per_llc,nr_apps)
+		iterator=generate_possible_mappings(list(range(nr_apps)),min_apps_llc,max_apps_llc,max_core_groups)
+	else:
+		iterator=generate_possible_clusters(list(range(len(workload))),nr_ways,max_cluster_size)
+
+		lfoc_uoptions=kwargs["user_options"].copy()
+		lfoc_uoptions["use_pair_clustering"]=True
+		lfoc_uoptions["benchmark_categories"]=kwargs["benchmark_categories"]
+		
+		## Use LFOC+ as an initial solution (heuristic)
+		sol_data=se.lfoc(workload,nr_ways,max_bandwidth,uoptions=kwargs["user_options"])
+		(sworkload,sper_app_ways,sper_app_masks,scluster_id)=sol_data
+		## Count clusters
+		ways_clust={}
+		map_apps={}
+		map_papps={}
+		nr_clusters=0
+		for i,clust_id in enumerate(scluster_id):
+			if not (clust_id in ways_clust):
+				ways_clust[clust_id]=sper_app_ways[i]
+				nr_clusters=nr_clusters+1
+				map_apps[clust_id]=[i]
+				map_papps[clust_id]=[sworkload[i]]
+			else:
+				map_apps[clust_id].append(i)
+				map_papps[clust_id].append(sworkload[i])
+		
+		num_clustering=[]
+		ways_per_cluster=[]
+		lf_clustering=[]
+		for i in range(nr_clusters):
+			num_clustering.append(map_apps[i])
+			ways_per_cluster.append(ways_clust[i])
+			lf_clustering.append(map_papps[i])
+
+		## Falta determinar coste solucion optima
+		lfcost=cost_function((sworkload,lf_clustering),ways_per_cluster,max_bandwidth)
+		clust_props["upper_bound"] = lfcost
+		clust_props["incumbent"] =(num_clustering,ways_per_cluster)
+
+	
 	## Determine table with number of solutions to drive execution
 	nsols=number_of_solutions_partitioning_dp(nr_ways, min(len(workload),nr_ways))
 
 	## Start connection right away
-	rc = ipp.Client(timeout=30000) #debug=True)
+	rc = ipp.Client(timeout=30000)#, debug=True)
 	nr_engines=len(rc.ids)
 
 	## Copy global data
@@ -606,7 +731,10 @@ def get_optimal_clustering_bf(workload, cost_function, maximize, nr_ways, max_ba
 			  "uoptions": uoptions,
 			  "multiprocessing": False,
 			  "use_bf": True, ## New parameter to force usage of best-first algorithm
-			  "bw_model": kwargs["bw_model"]}
+			  "bw_model": kwargs["bw_model"],
+			  "topology": kwargs["topology"],
+			  "opt_mapping": opt_mapping,
+			  "cache_part": kwargs["cache_part"]}
 	# Copy global data
 	ret=dview.apply_sync(lambda x: set_global_properties(x),dict_globals)
 
@@ -649,12 +777,16 @@ def get_optimal_clustering_bf(workload, cost_function, maximize, nr_ways, max_ba
 		# Filter based on the number of solutions
 		number_solutions=nsols[nr_ways-1][len(num_clustering)-1]
 
+		# To force entering sequential mode
+		# number_solutions=sol_threshold
 		if number_solutions>sol_threshold:
 			## Do it later 
 			pq.append(num_clustering)
 		else:
 			## Get optimal partitioning for that clustering solution
-			(local_cost,local_solution,local_branches)=determine_optimal_partitioning_for_clustering(num_clustering, workload, cost_function, max_bandwidth, clust_props["upper_bound"], maximize, nr_ways , uoptions, multiprocessing=False, use_bf=True)
+			(local_cost,local_solution,local_branches)=determine_optimal_partitioning_for_clustering(num_clustering, workload, cost_function, max_bandwidth, 
+				clust_props["upper_bound"], maximize, nr_ways , uoptions, multiprocessing=False, use_bf=True, opt_mapping=opt_mapping,
+			  cache_part=kwargs["cache_part"])
 			clust_props["total_nodes"]=clust_props["total_nodes"]+local_branches
 
 			if not local_solution is None:
@@ -662,7 +794,25 @@ def get_optimal_clustering_bf(workload, cost_function, maximize, nr_ways, max_ba
 				clust_props["upper_bound"] = local_cost
 				clust_props["incumbent"] =(num_clustering,local_solution)
 				if debug:
-					print "New solution found:", new_solution, this_cost 
+					print("New solution found:", new_solution, this_cost)
+
+
+	## Critical: send to the cluster everything else remaining to be processed
+	tasks_submitted=0
+
+	## Send everything that we have until a certain limit
+	while pq:
+		clust=pq.pop(0)
+		task = lview.apply_async(determine_optimal_partitioning_for_clustering_mp2, (clust,clust_props["upper_bound"]))
+
+		## Same callback as asynchronous stuff
+		task.add_done_callback(bb_task_completed)	
+
+		## Add pending task plus argument
+		pending_tasks.append(task)
+		num_clusts.append(clust)
+
+		tasks_submitted=tasks_submitted+1	
 
 	## Process pending tasks
 	while pending_tasks:
@@ -679,11 +829,67 @@ def get_optimal_clustering_bf(workload, cost_function, maximize, nr_ways, max_ba
 	rc.close()
 
 	(num_clustering,clustering_sol)=clust_props["incumbent"]
-
+	
 	## Redo interpolation
 	clustering=get_application_clustering_from_app_ids(num_clustering,workload)
 
-	(patched_workload,per_app_ways,per_app_masks,cluster_ids)=normalize_output_for_clustering_solution(workload,clustering,clustering_sol,nr_ways)
+	#################################################
+	## CRITICAL FOR THE BW MODEL TO WORK CORRECTLY
+	if kwargs["opt_mapping"]:
+		## If mapping update LLC ID before patch
+		for i,cluster in enumerate(clustering):
+			## Set LLC ID for each app in subworkload
+			for app in cluster:
+				app.llc_id=i
+	##################################################
+
+	## Rebuild solution for mapping/clustering case
+	if opt_mapping and (type(kwargs["cache_part"]) is str):
+		if kwargs["cache_part"]=="lfoc+" or kwargs["cache_part"]=="post-lfoc+":
+			lfoc_uoptions=kwargs.copy()
+			lfoc_uoptions.update(uoptions)
+			lfoc_uoptions["use_pair_clustering"]=True
+			lfoc_uoptions["simple_output"]=True	
+
+			clusters_part=[]
+			way_distribution=[]
+			## Get the original apps and apply LFOC for each LLC_ID
+			## Each cluster is a separate LLC
+			for i,cluster in enumerate(clustering):
+				subworkload=[app for app in cluster]
+				## Invoke LFOC+ for that
+				(subclusters,llc_way_distr)=se.lfoc(subworkload,nr_ways,max_bandwidth,lfoc_uoptions)	
+				clusters_part.extend(subclusters)
+				way_distribution.extend(llc_way_distr)
+
+
+			(patched_workload,per_app_ways,per_app_masks,cluster_ids)=normalize_output_for_clustering_solution(workload,clusters_part,way_distribution,nr_ways)
+		elif kwargs["cache_part"].startswith("optc-") or  kwargs["cache_part"].startswith("post-optc-"):
+			clusters_part=[]
+			way_distribution=[]
+			
+			for i,cluster in enumerate(clustering):
+				subworkload=[]
+				## disable for now
+				for app in cluster:
+					app.llc_id=-1
+					subworkload.append(app)
+				## Invoke Sequential optimal for that
+				(subclusters,llc_way_distr,local_branches)=get_optimal_clustering_seq(subworkload,cost_function,maximize,nr_ways,max_bandwidth,False,simple_output=True,user_options=uoptions,max_cluster_size=max_cluster_size)	
+				clust_props["total_nodes"]=clust_props["total_nodes"]+local_branches
+
+				## Reestablish llc_ids
+				for scluster in  subclusters:
+					for app in scluster:
+						app.llc_id=i
+
+				clusters_part.extend(subclusters)
+				way_distribution.extend(llc_way_distr)		
+			(patched_workload,per_app_ways,per_app_masks,cluster_ids)=normalize_output_for_clustering_solution(workload,clusters_part,way_distribution,nr_ways)		
+		else:
+			(patched_workload,per_app_ways,per_app_masks,cluster_ids)=normalize_output_for_clustering_solution(workload,clustering,clustering_sol,nr_ways,opt_mapping)
+	else:
+		(patched_workload,per_app_ways,per_app_masks,cluster_ids)=normalize_output_for_clustering_solution(workload,clustering,clustering_sol,nr_ways,opt_mapping)
 
 	if log_enabled:
 		add_trace_seq_item(trace,start,get_trace_timestamp(),start_datet,"7")

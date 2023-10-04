@@ -1,3 +1,5 @@
+## PBBCache
+
 PBBCache is a cache-partitioning simulator that relies on offline-collected application performance data (e.g., instructions per 
 cycle, memory bandwidth consumption, etc.) to determine the degree of throughput, fairness or other relevant metrics for a workload
 under a particular partitioning algorithm. A key feature of the simulator is its ability to efficiently determine the optimal
@@ -9,25 +11,34 @@ by comparing their effectiveness with that of the optimal solution provided by t
 Secondly, the ability to study the optimal solution for various optimization metrics makes the simulator
 a powerful tool to aid in the design of new cache-partitioning techniques.
 
-## Project dependencies
+## Installation
 
-The project relies on Python 2.7.9 or greater and uses the following Python modules:
+PBBCache supports Python 3 or greater. We recomend the following steps:
 
-* matplotlib
-* pandas
-* numpy
-* sympy
-* ipyparallel
-* sklearn
-* datetime
-* pytz
+1. Create virtual env and activate it:
 
-Note: After installing ipyparallel, the binaries that start the cluster are not included in the path sometimes. To do so you must find where are they installed and add them to the PATH:
+```bash
+> cd proyectos/pbbcache/
 
-	find ~ -name 'ipcluster'
-	export PATH=$PATH:$HOME/.local/bin
+> cd simulator/
 
-For more information on this library, recur to the [official documentation](https://ipyparallel.readthedocs.io/en/latest/)
+> python3.8 -m venv venv3
+
+> . venv3/bin/activate
+```
+
+2. Install dependencies inside venv:
+
+```bash
+> pip install --upgrade pip
+> pip install matplotlib pandas numpy sympy ipyparallel sklearn datetime pytz
+```
+
+3. For some systems, you will also need to install BLIS, as numpy depends on it:
+
+```bash
+> sudo apt install libblis3 libblis3-pthread
+```
 
 ## Getting started
 
@@ -48,7 +59,7 @@ $ ipcluster start -n 4 --daemonize
 Launch the simulator:
 
 ```
-$ ./test/sim.py -s input/metrics.csv input/workloads.csv -a opt-stp-bf,ucp -f table -b 35000 -p -m stalls -r 1
+$ ./test/sim.py -s input/metrics.csv input/workloads.csv -a opt-stp-bf,ucp -f table -b 35000 -p -m simple -r 1
 W#   Algorithm           BenchID Name                 Cluster       Mask/NR_WAYS    SlowdownNB/ANTT   STP               Slowdown         
 W1   opt-stp-bf          1       sphinx306            1             0x700(3)        1.07895           0.91197           1.09653          
 W1   opt-stp-bf          2       lbm06                2             0x80(1)         1.0097            0.957             1.04493          
@@ -137,4 +148,5 @@ optional arguments:
 * Jorge Casas Hernan (<jorcasas@ucm.es>)
 * Adrian Garcia Garcia (<adriagar@ucm.es>)
 * Juan Carlos Saez Alcaide (<jcsaezal@ucm.es>)
+* Carlos Bilbao (cbilbao@ucm.es)
 
