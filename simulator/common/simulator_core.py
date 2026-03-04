@@ -44,6 +44,10 @@ import uuid
 from ipyparallel.util import disambiguate_url
 import ctypes 
 from functools import reduce
+import subprocess
+import queue
+import signal
+import schedctl as sc
 
 # Function to parse a harness file
 def parse_harness_file(filename):
@@ -2779,13 +2783,29 @@ def bb_prune_pending(pending_tasks, pending_lbs, best_solution):
 
 nr_completed_bb_tasks=0
 cond_var=threading.Condition()
+signal_queue = queue.Queue()
 tasks_completed=[]
+nr_active_workers=4
+active_workers_changed=False
+malleable_cluster=None
 
-def reset_completion_variables():
+def get_malleable_cluster():
+	global malleable_cluster
+	return malleable_cluster
+
+def set_malleable_cluster(mc):
+	global malleable_cluster
+	malleable_cluster=mc
+
+def reset_completion_variables(initial_workers=4):
 	global nr_completed_bb_tasks
 	global cond_var
 	global tasks_completed
+	global nr_active_workers
+	global active_workers_changed
+	nr_active_workers=initial_workers
 	nr_completed_bb_tasks=0
+	active_workers_changed=False
 	del tasks_completed[:]
 
 
@@ -2799,6 +2819,34 @@ def wait_until_task_completed():
 	while nr_completed_bb_tasks==0:
 		cond_var.wait()
 
+	## Reset bb task count
+	nr_completed_bb_tasks=0
+	for task in tasks_completed:
+		completed.append(task)
+
+	del tasks_completed[:] ## clear() method is python 3
+
+
+	cond_var.release()
+
+	return completed
+
+def wait_until_task_completed_or_event():
+	global nr_completed_bb_tasks
+	global cond_var
+	global tasks_completed
+	global active_workers_changed
+	completed=[]
+	cond_var.acquire()
+
+	while nr_completed_bb_tasks==0 and not active_workers_changed:
+		cond_var.wait()
+
+	## Special notification case (list is empty)
+	if active_workers_changed and nr_completed_bb_tasks==0:
+		active_workers_changed=False
+		return []
+     
 	## Reset bb task count
 	nr_completed_bb_tasks=0
 	for task in tasks_completed:
@@ -2827,6 +2875,24 @@ def notify_task_completion(task):
 
 	cond_var.release()
 
+
+def get_current_worker_count():
+	global nr_active_workers
+	return nr_active_workers
+
+def notify_change_workers(new_worker_count):
+	global nr_active_workers
+	global active_workers_changed
+	cond_var.acquire()
+
+	## Reset flag and update workers
+	active_workers_changed=True
+	nr_active_workers=new_worker_count
+
+	## In this case there is only one thread, so wake it up if necessary
+	cond_var.notify()
+
+	cond_var.release()	
 
 ## Note that the callback is executed in the current thread (launcher)
 ## if the task was cancelled. Otherwise the callback is executed by a different
@@ -2876,6 +2942,149 @@ def bb_process_pending(pending_tasks, pending_lbs,bb_props,op, completed=None):
 		deleted+=bb_prune_pending(pending_tasks, pending_lbs, best_solution)
 
 	return deleted
+
+
+pid_agent=-1 
+thread_handler=None
+
+def handle_signal(signum, frame):
+	signal_queue.put(signum)
+
+
+def cleanup_signals():
+	# Restore default signal handlers before exiting
+	signal.signal(signal.SIGUSR1, signal.SIG_DFL)
+	signal.signal(signal.SIGUSR2, signal.SIG_DFL)
+	signal.signal(signal.SIGINT, signal.SIG_DFL)
+	signal.signal(signal.SIGTERM, signal.SIG_DFL)
+
+def setup_signal_handlers():
+	# Register signal handlers
+	signal.signal(signal.SIGUSR1, handle_signal)
+	signal.signal(signal.SIGUSR2, handle_signal)
+	signal.signal(signal.SIGINT, handle_signal)
+	signal.signal(signal.SIGTERM, handle_signal)
+
+
+def	elasticity_agent_thread(initial_worker_count, max_worker_count):
+	signum=0
+
+	## Loop to process signals...
+	while True:
+		signum = signal_queue.get()
+		if signum == signal.SIGUSR1:
+			new_count=sc.get_num_threads()
+			notify_change_workers(new_count)
+			print("New worker count is %d\n" % new_count, file=sys.stderr)
+		elif signum == signal.SIGUSR2:
+			print("SIGUSR2 received.")
+		elif signum in (signal.SIGINT, signal.SIGTERM):
+			print("Termination signal received. Cleaning up")
+			break
+	
+ 	## Special case for CTRL+C
+	if signum==signal.SIGINT:
+		sys.exit(0)
+	return None
+
+
+def launch_elasticity_thread(initial_worker_count, max_worker_count):
+	global thread_handler
+ 	## First of all...
+	setup_signal_handlers()
+
+	val=sc.schedctl_retrieve()
+
+	if (val==-1):
+		printf("schedctl_retrieve failed", file=sys.stderr)
+		sys.exit(1)    
+	
+	val=sc.set_master_thread()
+
+	if (val==-1):
+		printf("set_master_thread failed", file=sys.stderr)
+		sc.schedctl_release()
+		sys.exit(1)
+    
+	val=sc.enable_malleability()
+
+	if (val==-1):
+		printf("enable_malleability failed", file=sys.stderr)
+		sc.schedctl_release()
+		sys.exit(1)
+
+	# Create and start the thread in charge of reacting to signals
+	thread_handler = threading.Thread(target=elasticity_agent_thread, args=(initial_worker_count, max_worker_count))
+	thread_handler.start()
+	print("Started elasticity agent thread with ID %d" % threading.get_ident(), file=sys.stderr)
+
+	return None
+
+
+def stop_elasticity_thread():
+	print("Terminating elasticity agent")
+	global thread_handler
+	# Terminate elasticity agent by placing
+ 	# a fake signal ID in the queue
+	signal_queue.put(signal.SIGTERM)
+ 	# Wait for the launch thread to complete
+	thread_handler.join()
+  
+	#Free up resources
+	sc.disable_malleability()
+	sc.unset_master_thread()
+	sc.schedctl_release()
+
+	cleanup_signals()
+ 
+ 
+def	elasticity_agent_thread_old(comm_queue, initial_worker_count, max_worker_count):
+	# Launch the 'elasticity_agent' program
+	pbbcache_dir=os.getenv('PBBCACHE')
+	program="%s/test/elasticity_agent" % pbbcache_dir
+	process = subprocess.Popen([program, str(initial_worker_count), str(max_worker_count)], stdout=subprocess.PIPE, stderr=subprocess.PIPE, universal_newlines=True)
+ 
+	# Get the PID of the process
+	process_pid = process.pid
+ 
+	i=0
+	# Read output line by line
+	for line in process.stdout:
+		if i==0:
+			## Ignore first line (indicator that everything is ready!!)
+   			## Send the pid over the queue 
+			comm_queue.put(process_pid)
+			#print("Agent is ready")
+		else:
+			new_count=int(line.strip())
+			notify_change_workers(new_count)
+			print("New worker count is %d\n" % new_count, file=sys.stderr)
+		i=i+1
+
+	return None
+
+def launch_elasticity_thread_old(initial_worker_count, max_worker_count):
+	global pid_agent
+	global thread_handler
+	# Create a thread-safe queue to store output
+	sync_queue = queue.Queue()
+	
+	# Create and start the thread to launch the elasticity_agent
+	thread_handler = threading.Thread(target=elasticity_agent_thread, args=(sync_queue,initial_worker_count, max_worker_count))
+	thread_handler.start()
+	## Wait until the process is created
+	pid = sync_queue.get()
+	print("Started elasticity agent with PID %d" % pid_agent, file=sys.stderr)
+	return pid,thread_handler
+ 
+ 
+def stop_elasticity_thread_old():
+	global pid_agent
+	global thread_handler
+	# Terminate elasticity agent
+	os.kill(pid_agent, signal.SIGTERM)
+	# Wait for the launch thread to complete
+	thread_handler.join()
 
 
 ## Busqueda en anchura del arbol
@@ -4075,6 +4284,25 @@ def get_user_assignment(workload,nr_ways,workload_name,**kwargs):
 
 	return (patched_workload,per_app_ways,per_app_masks,cluster_id)
 
+
+def determine_num_possible_solutions_mapping(napps,size_core_group,num_core_groups):
+	collection=list([i+1 for i in range(napps)])
+	it=generate_possible_mappings(collection,size_core_group,size_core_group,num_core_groups)
+	return len(list(it))
+    
+def determine_num_possible_solutions_mapping_part(napps,size_core_group,num_core_groups,nr_ways):
+	collection=list([i+1 for i in range(napps)])
+	mapit=generate_possible_mappings(collection,size_core_group,size_core_group,num_core_groups)
+ 
+	nr_mappings=0
+	nr_options=0
+	for mapping in mapit:
+		nr_mappings=nr_mappings+1
+		for core_group in mapping:
+			num=determine_number_of_cluster_cache_partitioning(nr_ways,len(core_group))
+			nr_options=nr_options+num
+	return (nr_mappings,nr_options)
+    
 
 if __name__ == "__main__":
 #	l=[c for c in generate_possible_clusters(["A","B","C","D","E"],3)]

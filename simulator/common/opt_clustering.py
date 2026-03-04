@@ -22,6 +22,7 @@ from simulator_core import *
 import simulator_exploration as se
 import datetime
 import pytz
+import signal
 
 # Function that applies the UCP algorithm to an array of clusters
 # Params: Array of clusters
@@ -605,7 +606,11 @@ def get_optimal_clustering_bf(workload, cost_function, maximize, nr_ways, max_ba
 	kwargs.setdefault("opt_mapping",False)
 	kwargs.setdefault("cache_part",None)
 	kwargs.setdefault("allow_unbalanced_mapping",True)
-
+	kwargs.setdefault("active_workers",0)
+	kwargs.setdefault("max_workers",0)
+	kwargs.setdefault("malleability",False)
+	kwargs.setdefault("malleable_cluster",None)
+ 
 	uoptions=kwargs["user_options"]
 
 	if uoptions:
@@ -627,10 +632,11 @@ def get_optimal_clustering_bf(workload, cost_function, maximize, nr_ways, max_ba
 	opt_mapping=kwargs["opt_mapping"]
 	max_core_groups=kwargs["max_core_groups"]
 	allow_unbalanced_mapping=kwargs["allow_unbalanced_mapping"]
+	active_workers=kwargs["active_workers"]
+	max_workers=kwargs["max_workers"]
+	malleability=kwargs["malleability"]
 
 	metadatum = {}
-
-	reset_completion_variables()
 
 	clust_props= { "node_queue": pq,
 							"num_clusts": num_clusts,
@@ -715,12 +721,25 @@ def get_optimal_clustering_bf(workload, cost_function, maximize, nr_ways, max_ba
 
 	
 	## Determine table with number of solutions to drive execution
-	nsols=number_of_solutions_partitioning_dp(nr_ways, min(len(workload),nr_ways))
+	nsols=number_of_solutions_partitioning_dp(nr_ways, min(len(workload),nr_ways))	
 
-	## Start connection right away
-	rc = ipp.Client(timeout=30000)#, debug=True)
-	nr_engines=len(rc.ids)
+	if not malleability:
+		## Start connection right away
+		rc = ipp.Client(timeout=30000)#, debug=True)
+		nr_engines=len(rc.ids)
+		## If no malleability is enabled, use legacy
+		## value for active_workers (formerly limit_queue)
+		if max_workers==0:
+			active_workers=dyn_load_factor*nr_engines
+		else:
+			active_workers=max_workers			
 
+		reset_completion_variables(active_workers)
+	else:
+		## Use existing malleable cluster
+		rc=get_malleable_cluster()
+  
+ 
 	## Copy global data
 	dview = rc[:]
 	dict_globals={"workload": workload,
@@ -741,16 +760,15 @@ def get_optimal_clustering_bf(workload, cost_function, maximize, nr_ways, max_ba
 	lview = rc.load_balanced_view()
 	lview.block = False
 
-	## Populate 
-	limit_queue=dyn_load_factor*nr_engines 
+	simulations_remaining=True
 
-	for num_clustering in iterator:
+	while len(pq)>0 or pending_tasks or simulations_remaining:
 		## While saturated queue
-		while len(pq)>limit_queue:
+		while len(pq)>get_current_worker_count() or (not simulations_remaining and pending_tasks):
 			tasks_submitted=0
 
 			## Send everything that we have until a certain limit
-			while pq and len(pending_tasks)<=limit_queue:
+			while pq and len(pending_tasks)<=get_current_worker_count():
 				clust=pq.pop(0)
 				task = lview.apply_async(determine_optimal_partitioning_for_clustering_mp2, (clust,clust_props["upper_bound"]))
 
@@ -767,67 +785,48 @@ def get_optimal_clustering_bf(workload, cost_function, maximize, nr_ways, max_ba
 				if log_enabled:
 					add_trace_seq_item(trace,start,get_trace_timestamp(),start_datet,"7")
 
-				completed=wait_until_task_completed()
+				completed=wait_until_task_completed_or_event()
 				if log_enabled:
 					start=get_trace_timestamp()
 				if len(completed)>0:
 					clust_process_pending(pending_tasks, num_clusts, clust_props, op) # completed)
 
-		## Enqueue new task if not a small B&B
-		# Filter based on the number of solutions
-		number_solutions=nsols[nr_ways-1][len(num_clustering)-1]
+		## Schedule new submission if something remains
+		if simulations_remaining:
+			try:		
+				num_clustering=next(iterator)
+			except StopIteration:
+				simulations_remaining=False
+				continue ## Go to next loop iteration
 
-		# To force entering sequential mode
-		# number_solutions=sol_threshold
-		if number_solutions>sol_threshold:
-			## Do it later 
-			pq.append(num_clustering)
-		else:
-			## Get optimal partitioning for that clustering solution
-			(local_cost,local_solution,local_branches)=determine_optimal_partitioning_for_clustering(num_clustering, workload, cost_function, max_bandwidth, 
-				clust_props["upper_bound"], maximize, nr_ways , uoptions, multiprocessing=False, use_bf=True, opt_mapping=opt_mapping,
-			  cache_part=kwargs["cache_part"])
-			clust_props["total_nodes"]=clust_props["total_nodes"]+local_branches
+			## Enqueue new task if not a small B&B
+			# Filter based on the number of solutions
+			number_solutions=nsols[nr_ways-1][len(num_clustering)-1]
 
-			if not local_solution is None:
-				## Update incumbent and cost
-				clust_props["upper_bound"] = local_cost
-				clust_props["incumbent"] =(num_clustering,local_solution)
-				if debug:
-					print("New solution found:", new_solution, this_cost)
+			# To force entering sequential mode
+			# number_solutions=sol_threshold
+			if number_solutions>sol_threshold:
+				## Do it later 
+				pq.append(num_clustering)
+			else:
+				## Get optimal partitioning for that clustering solution
+				(local_cost,local_solution,local_branches)=determine_optimal_partitioning_for_clustering(num_clustering, workload, cost_function, max_bandwidth, 
+				clust_props["upper_bound"], maximize, nr_ways , uoptions, multiprocessing=False, use_bf=True, opt_mapping=opt_mapping, cache_part=kwargs["cache_part"])
+				
+				clust_props["total_nodes"]=clust_props["total_nodes"]+local_branches
 
+				if not local_solution is None:
+					## Update incumbent and cost
+					clust_props["upper_bound"] = local_cost
+					clust_props["incumbent"] =(num_clustering,local_solution)
+					if debug:
+						print("New solution found:", new_solution, this_cost)	
 
-	## Critical: send to the cluster everything else remaining to be processed
-	tasks_submitted=0
-
-	## Send everything that we have until a certain limit
-	while pq:
-		clust=pq.pop(0)
-		task = lview.apply_async(determine_optimal_partitioning_for_clustering_mp2, (clust,clust_props["upper_bound"]))
-
-		## Same callback as asynchronous stuff
-		task.add_done_callback(bb_task_completed)	
-
-		## Add pending task plus argument
-		pending_tasks.append(task)
-		num_clusts.append(clust)
-
-		tasks_submitted=tasks_submitted+1	
-
-	## Process pending tasks
-	while pending_tasks:
-		if log_enabled:
-			add_trace_seq_item(trace,start,get_trace_timestamp(),start_datet,"7")
-
-		completed=wait_until_task_completed()
-		
-		if log_enabled:
-			start=get_trace_timestamp()
-		if len(completed)>0:
-			clust_process_pending(pending_tasks, num_clusts, clust_props, op) 	
-
-	rc.close()
-
+	if not malleability:
+		rc.close()
+	else:
+		reset_completion_variables(get_current_worker_count())
+  
 	(num_clustering,clustering_sol)=clust_props["incumbent"]
 	
 	## Redo interpolation

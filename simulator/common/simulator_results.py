@@ -25,6 +25,9 @@ from opt_clustering import *
 from simulator_exploration import *
 import numpy as np
 import pandas as pd
+import signal
+import time
+import os
 
 ## Efficient function to determine all metrics from slowdown vector...
 ## Returns a dictionary with the collected metrics....
@@ -654,6 +657,161 @@ def execute_simulation(simulation):
 
 	return apply_part_algorithm(algorithm,workloads[idx_workload],nr_ways,max_bandwidth,parallel=False,debugging=False,uoptions=uoptions,workload_name=wname,opt_spec=opt_spec)
 
+# Function to process pending tasks
+# and mark them to be deleted if they have been completed 
+# or if they are no longer better that a new upper bound
+# Add result of completed task to result vector 
+def process_pending_simulation(pending_tasks, result_vector, completed=None):
+	## Traverse pending tasks
+	i=0
+	deleted=0
+	better_solution_found=False
+
+	if completed is None:
+		## First stage (check pending tasks that completed)
+		for task in pending_tasks[:]:
+			if task.ready():
+				if not task.cancelled():
+					result=task.get() 
+					result_vector.append(result)
+				pending_tasks.remove(task)	
+				deleted=deleted+1
+				#print "task", i, "completed. Removing from list"	
+			else:
+				i=i+1
+	else:
+		for task in completed:
+			i=pending_tasks.index(task)
+			if i==-1 or not task.ready():
+				if not task.cancelled():
+					result=task.get() 
+					result_vector.append(result)
+			deleted=deleted+1
+
+	return deleted
+
+
+def launch_simulations_in_parallel2(workloads,algorithms,workload_range,nr_ways,max_bandwidth, uoptions,bw_model):
+	parallel=False ## Forced
+	debugging=False #True
+ 
+	if "active_workers" in uoptions:
+		active_workers=int(uoptions["active_workers"])
+	else:
+		active_workers=8 ## To test malleability (Fixed for now)
+  
+	if "max_workers" in uoptions:
+		max_workers=int(uoptions["max_workers"])
+	else:
+		max_workers=20 ## To test malleability (Fixed for now)
+  
+	if "malleability" in uoptions:
+		rval=int(uoptions["malleability"])		
+		if rval!=0:
+			malleability=True
+		else:
+			malleability=False
+	else:
+		malleability=False
+	## We are going to use the generic mechanism for
+	## asynchronous tasks, so reset variables
+	reset_completion_variables(active_workers)
+ 
+	if malleability:
+		## Launch secondary thread and wait until the elasticity manager has been launched
+		launch_elasticity_thread(active_workers, max_workers)
+ 
+	
+		## Allocate 4 extra threads
+		#for _ in range(4):
+		#	os.kill(pid_agent, signal.SIGUSR1)
+		#	time.sleep(0.1)
+  
+  	# Establish connection with cluster/engines
+	rc = ipp.Client(timeout=30000) 
+	nr_engines=len(rc.ids)  
+    
+	# Set up global simulation parameters in engines
+	dview = rc[:]
+	dict_globals={"workloads":workloads,
+			"max_bandwidth": max_bandwidth,
+			"algorithms": algorithms,
+			"nr_ways": nr_ways,
+			"uoptions": uoptions,
+			"bw_model": bw_model}
+
+	if debugging:
+		set_global_simulation_properties(dict_globals)
+	
+	# Copy global data
+	ret=dview.apply_sync(lambda x: set_global_simulation_properties(x),dict_globals)
+
+	## Generate simulation set 
+	simulations=[]
+	for widx in workload_range:
+		for alg_idx,algorithm in enumerate(algorithms):
+			simulations.append((widx,alg_idx))
+  
+	# FOr lazy iterations 
+	sim_iterator=iter(simulations)
+	simulations_remaining=len(simulations)
+
+	pq=[] ## Clustering queue
+	pending_tasks=[]
+	results=[]
+	
+	if debugging:
+		results=[r for r in map(lambda simdata: execute_simulation(simdata), simulations)]
+	else:
+		## Execute simulations in parallel
+		lview = rc.load_balanced_view(block=True)
+
+		while len(pq)>0 or pending_tasks or simulations_remaining>0:
+			tasks_submitted=0
+			
+			## Submit everything that we have until a certain limit
+			while pq and len(pending_tasks)<get_current_worker_count():
+				simulation=pq.pop(0)
+				#print("Launching simulation",simulation)
+				task = lview.apply_async(execute_simulation, (simulation))
+				## Same callback as asynchronous stuff
+				task.add_done_callback(bb_task_completed)	
+				## Add pending task plus argument
+				pending_tasks.append(task)
+				tasks_submitted=tasks_submitted+1	
+
+			##print(get_current_worker_count())
+			## If we cannot submit anything else wait for one task to
+			## be completed
+			if tasks_submitted==0 and pending_tasks:
+				completed=wait_until_task_completed_or_event()
+				if len(completed)>0:
+					process_pending_simulation(pending_tasks, results)
+				else:
+					print("Detected change in worker count:",get_current_worker_count())
+					pass 
+					## Change in thread count
+		
+			## Schedule new submission 
+			if simulations_remaining>0:
+				next_sim=next(sim_iterator)
+				#except StopIteration:
+				pq.append(next_sim)
+				simulations_remaining=simulations_remaining-1
+
+	## Turn results into a dictionary
+	resdict={}
+	for i,simdata in enumerate(simulations):
+		resdict[simdata]=results[i]
+
+	if malleability:
+ 	    stop_elasticity_thread()
+
+
+	rc.close()
+ 
+	## Return dict with simulation results
+	return resdict
 
 
 def launch_simulations_in_parallel(workloads,algorithms,workload_range,nr_ways,max_bandwidth, uoptions,bw_model):

@@ -388,8 +388,32 @@ for idx_alg,alg in enumerate(alg_spec):
 
 ## Launch simulations in parallel if the user requested it 
 if args.parsim:
-	results=launch_simulations_in_parallel(workloads,alg_spec,workload_range,nr_ways,max_bandwidth, optdict,args.bw_model)
-
+	results=launch_simulations_in_parallel2(workloads,alg_spec,workload_range,nr_ways,max_bandwidth, optdict,args.bw_model)
+else:
+	if ("malleability" in optdict) and optdict["malleability"]==1:
+		## Start connection right away
+		rc = ipp.Client(timeout=30000)#, debug=True)
+		nr_engines=len(rc.ids)
+		set_malleable_cluster(rc)
+		## Be careful with default values
+		if not ("active_workers" in optdict):
+			active_workers=nr_engines
+		else:
+			active_workers=optdict["active_workers"]
+       
+		if not ("max_workers" in optdict):
+			max_workers=nr_engines
+		else:
+			max_workers=optdict["max_workers"]
+   
+## Launch secondary thread and wait until the elasticity manager has been launched
+		launch_elasticity_thread(active_workers, max_workers)
+		## Reset completion variables
+		reset_completion_variables(active_workers)
+  
+		malleability=True	
+	else:
+		malleability=False
 
 show_header=True
 for idx in workload_range:
@@ -431,6 +455,13 @@ for idx in workload_range:
 			metrics=compute_basic_metrics(sol_data,max_bandwidth)
 			data[alg_name].append(LabeledPoint(wname, metrics["stp"], metrics["unfairness"]))
 
+
+if not args.parsim and malleability:
+	# Terminate elasticity agent
+	stop_elasticity_thread()
+ 	## Close connection
+	print("Stopping connection with ipycluster")
+	rc.close()
 
 if args.generate_chart:
 	fsize=16

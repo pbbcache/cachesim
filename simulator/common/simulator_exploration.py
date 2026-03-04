@@ -555,7 +555,7 @@ def get_benchmark_categories_from_file(catfile, label_format=False):
 	csv_file.close()
 
 	if label_format:
-		categories_labels = {0:"light-sharing", 1:"streaming", 2:"cache-sensitive", 3:"unknown"}
+		categories_labels = {0:"light-sharing", 1:"streaming", 2:"cache-sensitive"}
 		for key in classes.keys():
 			if key not in classes:
 				print("Warning key not found (%d). Defaulting to light-sharing", key)
@@ -573,6 +573,7 @@ def lfoc(workload,nr_ways,max_bandwidth,uoptions={}):
 	uoptions.setdefault("max_ways_streaming",2)
 	uoptions.setdefault("streaming_part_size",1)	
 	uoptions.setdefault("use_pair_clustering",False)
+	uoptions.setdefault("use_stalls_l2",False)
 	uoptions.setdefault("collide_streaming_partitions",True)
 	uoptions.setdefault("opt",False)
 	uoptions.setdefault("simple_output",False)
@@ -681,6 +682,7 @@ def lfoc(workload,nr_ways,max_bandwidth,uoptions={}):
 
 
 		
+		
 	else:
 		## Add sensitive clusters right here
 		for app in apps_assigned:
@@ -691,8 +693,11 @@ def lfoc(workload,nr_ways,max_bandwidth,uoptions={}):
 
 		assert(nr_clusters<=nr_ways)
 
-		## Run UCP only with sensitive benchmarks
-		clustering_sol=get_schedule_UCP_gen(apps_assigned,nr_ways-nr_reserved_ways,metric=ucp_metric)
+		if uoptions["use_stalls_l2"]:
+			clustering_sol=stall_based_part(apps_assigned,nr_ways-nr_reserved_ways,max_bandwidth,uoptions=uoptions)
+		else:
+      		## Run UCP only with sensitive benchmarks
+			clustering_sol=get_schedule_UCP_gen(apps_assigned,nr_ways-nr_reserved_ways,metric=ucp_metric)
 
 	## Create partitions for streaming and assign streaming
 	if nr_reserved_ways:
@@ -2459,9 +2464,42 @@ def trivial_mapping(workload, nr_ways, max_bandwidth, uoptions={}):
 	return normalize_output_for_clustering_solution(workload,clusters,clustering_sol,nr_ways)
 
 
+def stall_based_part(workload, nr_ways, max_bandwidth, uoptions={}):
+	total_weight=0
+	uoptions.setdefault("default_ways_stalls", 3)
+	default_ways_stalls = uoptions["default_ways_stalls"]
+	weights=[]
+	total_weight=0
+
+	for app in workload: 
+		val=app.properties["stalls_l2_miss"][default_ways_stalls]
+		## Integer arithmetic for simplicity
+		normalized_value=int((val*1000)/default_ways_stalls)
+		weights.append(normalized_value)
+		total_weight+=normalized_value
+	
+	solution=[]
+	nr_remaining_apps=len(workload)
+	remaining_ways=nr_ways
+	i=0
+	while (nr_remaining_apps>0):
+		if remaining_ways<1:
+			nr_fair_ways=1
+		else:
+			nr_fair_ways=max(1,(remaining_ways*weights[i])/total_weight)
+		
+		solution.append(nr_fair_ways)
+		remaining_ways=remaining_ways-nr_fair_ways
+		total_weight=total_weight-weights[i]
+		i=i+1
+		nr_remaining_apps=nr_remaining_apps-1
+
+	return solution
+
+
 def add_experimental_algorithms():
 	add_extra_algorithms("dunn","bw-on-demand","class","class-stream","class-sens","lfoc","poptc","poptc-unf","poptc-stp","poptc-slow","pair-clustering",
-		"scluster","lfoc+","lfoc-opt","ucp-unfairness","cpa","popt-map","popt-map-unf","popt-map-stp","popt-map-cov", "dio", "dino", "llc_bw_balancer", "llc_bw_balancer_compositions", "trivial_mapping")
+		"scluster","lfoc+","lfoc-s","lfoc-opt","ucp-unfairness","cpa","popt-map","popt-map-unf","popt-map-stp","popt-map-cov", "dio", "dino", "llc_bw_balancer", "llc_bw_balancer_compositions", "trivial_mapping","stall-based")
 
 
 def invoke_extra_algorithm(algorithm,workload,nr_ways,max_bandwidth,parallel=False,debugging=False,uoptions={},opt_spec=(unfairness,"False")):
@@ -2490,6 +2528,10 @@ def invoke_extra_algorithm(algorithm,workload,nr_ways,max_bandwidth,parallel=Fal
 		uoptions["use_pair_clustering"]=True
 		(patched_workload,per_app_ways,per_app_masks,cluster_id)=lfoc(workload,nr_ways,max_bandwidth,uoptions)		
 		uoptions["use_pair_clustering"]=False
+	elif algorithm=="lfoc-s":
+		uoptions["use_stalls_l2"]=True
+		(patched_workload,per_app_ways,per_app_masks,cluster_id)=lfoc(workload,nr_ways,max_bandwidth,uoptions)		
+		uoptions["use_stalls_l2"]=False
 	elif algorithm=="lfoc-opt":
 		uoptions["opt"]=True
 		(patched_workload,per_app_ways,per_app_masks,cluster_id)=lfoc(workload,nr_ways,max_bandwidth,uoptions)			
@@ -2513,7 +2555,10 @@ def invoke_extra_algorithm(algorithm,workload,nr_ways,max_bandwidth,parallel=Fal
 	elif algorithm=="llc_bw_balancer_compositions":
 		(patched_workload,per_app_ways,per_app_masks,cluster_id) = llc_bw_balancer_compositions(workload, nr_ways, max_bandwidth,uoptions)
 	elif algorithm=="trivial_mapping":
-		(patched_workload,per_app_ways,per_app_masks,cluster_id) = trivial_mapping(workload, nr_ways, max_bandwidth, uoptions)		
+		(patched_workload,per_app_ways,per_app_masks,cluster_id) = trivial_mapping(workload, nr_ways, max_bandwidth, uoptions)	
+	elif algorithm=="stall-based":
+		solution=stall_based_part(workload,nr_ways,max_bandwidth)
+		(patched_workload,per_app_ways,per_app_masks,cluster_id)=(workload,solution,get_partition_masks(solution),[i for i in range(1,len(workload)+1)])	
 	else:
 		print("algorithm not valid: %s" % algorithm)
 		exit(1)		
